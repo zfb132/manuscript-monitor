@@ -33,6 +33,23 @@ from selenium.webdriver.support.ui import WebDriverWait
 LOGGER = logging.getLogger(__name__)
 
 ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+APPRISE_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*")
+
+SUPPRESSED_OPERATION_ERROR_TYPE = "SuppressedException"
+SUPPRESSED_OPERATION_ERROR_MESSAGE = "Operation failed; error details were suppressed."
+INVALID_DESTINATION_ERROR_TYPE = "InvalidDestination"
+INVALID_DESTINATION_ERROR_MESSAGE = "Apprise rejected this destination."
+DELIVERY_FAILED_ERROR_TYPE = "DeliveryFailed"
+DELIVERY_FAILED_ERROR_MESSAGE = "Apprise reported a failed delivery."
+APPRISE_EXCEPTION_ERROR_TYPE = "AppriseException"
+APPRISE_EXCEPTION_ERROR_MESSAGE = "Apprise delivery raised an exception."
+ALLOWED_DELIVERY_FAILURES = frozenset(
+    {
+        (INVALID_DESTINATION_ERROR_TYPE, INVALID_DESTINATION_ERROR_MESSAGE),
+        (DELIVERY_FAILED_ERROR_TYPE, DELIVERY_FAILED_ERROR_MESSAGE),
+        (APPRISE_EXCEPTION_ERROR_TYPE, APPRISE_EXCEPTION_ERROR_MESSAGE),
+    }
+)
 
 ROOT_KEYS = frozenset({"storage", "browser", "accounts"})
 STORAGE_KEYS = frozenset({"database_path"})
@@ -500,17 +517,17 @@ def extract_apprise_scheme(url: str) -> str:
         candidate = urlsplit(url).scheme.lower()
     except ValueError:
         return "unknown"
-    return candidate if re.fullmatch(r"[a-z][a-z0-9+.-]*", candidate) else "unknown"
+    return candidate if APPRISE_SCHEME.fullmatch(candidate) else "unknown"
 
 
 def redact_exception(
     exc: BaseException,
     secrets: Iterable[str] = (),
 ) -> RedactedError:
-    del secrets
+    del exc, secrets
     return RedactedError(
-        type(exc).__name__,
-        "Operation failed; error details were suppressed.",
+        SUPPRESSED_OPERATION_ERROR_TYPE,
+        SUPPRESSED_OPERATION_ERROR_MESSAGE,
     )
 
 
@@ -534,25 +551,25 @@ def deliver_notifications(
                 success = bool(notifier.notify(title=title, body=body)) if added else False
             finally:
                 logging.disable(previous_disable_level)
-        except Exception as exc:
+        except Exception:
             results.append(
                 DeliveryResult(
                     index,
                     scheme,
                     clock(),
                     False,
-                    type(exc).__name__,
-                    "Apprise delivery raised an exception.",
+                    APPRISE_EXCEPTION_ERROR_TYPE,
+                    APPRISE_EXCEPTION_ERROR_MESSAGE,
                 )
             )
             continue
 
         if not added:
-            error_type = "InvalidDestination"
-            error_message = "Apprise rejected this destination."
+            error_type = INVALID_DESTINATION_ERROR_TYPE
+            error_message = INVALID_DESTINATION_ERROR_MESSAGE
         elif not success:
-            error_type = "DeliveryFailed"
-            error_message = "Apprise reported a failed delivery."
+            error_type = DELIVERY_FAILED_ERROR_TYPE
+            error_message = DELIVERY_FAILED_ERROR_MESSAGE
         else:
             error_type = None
             error_message = None
@@ -1074,11 +1091,37 @@ def prepare_check(
     )
 
 
+def _validated_delivery_timestamp(result: DeliveryResult) -> str:
+    if (
+        type(result.destination_index) is not int
+        or result.destination_index < 0
+        or type(result.scheme) is not str
+        or APPRISE_SCHEME.fullmatch(result.scheme) is None
+        or type(result.attempted_at) is not datetime
+        or result.attempted_at.tzinfo is None
+        or result.attempted_at.utcoffset() is None
+        or type(result.success) is not bool
+    ):
+        raise DatabaseError("The delivery result is invalid.")
+    if result.success:
+        valid_outcome = result.error_type is None and result.error_message is None
+    else:
+        valid_outcome = (
+            type(result.error_type) is str
+            and type(result.error_message) is str
+            and (result.error_type, result.error_message) in ALLOWED_DELIVERY_FAILURES
+        )
+    if not valid_outcome:
+        raise DatabaseError("The delivery result is invalid.")
+    return utc_text(result.attempted_at)
+
+
 def record_delivery(
     conn: sqlite3.Connection,
     batch_id: int,
     result: DeliveryResult,
 ) -> None:
+    attempted_at = _validated_delivery_timestamp(result)
     with conn:
         cursor = conn.execute(
             "INSERT INTO notification_deliveries("
@@ -1088,7 +1131,7 @@ def record_delivery(
                 batch_id,
                 result.destination_index,
                 result.scheme,
-                utc_text(result.attempted_at),
+                attempted_at,
                 int(result.success),
                 result.error_type,
                 result.error_message,
@@ -1098,34 +1141,82 @@ def record_delivery(
             raise DatabaseError("The delivery attempt could not be recorded.")
 
 
-def _validate_deferred_projections(
-    conn: sqlite3.Connection,
+def _prepared_event_projections(
     prepared: PreparedCheck,
-) -> tuple[str, ...]:
+) -> tuple[tuple[int, int, str], ...]:
+    if len(prepared.events) != len(prepared.deferred_updates):
+        raise DatabaseError("Prepared events and deferred projections must have equal counts.")
     period_ids = [update.tracking_period_id for update in prepared.deferred_updates]
     if len(period_ids) != len(set(period_ids)):
         raise DatabaseError("Deferred projection periods must be unique.")
-
-    external_ids: list[str] = []
-    for update in prepared.deferred_updates:
-        rows = conn.execute(
-            "SELECT manuscripts.external_id FROM observations "
-            "JOIN tracking_periods "
-            "ON tracking_periods.id = observations.tracking_period_id "
-            "JOIN manuscripts ON manuscripts.id = tracking_periods.manuscript_id "
-            "WHERE observations.id = ? AND observations.tracking_period_id = ? "
-            "AND observations.check_id = ? AND manuscripts.account_id = ?",
+    try:
+        projections = tuple(
             (
-                update.observation_id,
                 update.tracking_period_id,
-                prepared.check_id,
-                prepared.account_id,
-            ),
-        ).fetchall()
-        if len(rows) != 1:
-            raise DatabaseError("A deferred projection is stale or belongs to another check.")
-        external_ids.append(str(rows[0]["external_id"]))
-    return tuple(external_ids)
+                update.observation_id,
+                event.external_id,
+            )
+            for event, update in zip(
+                prepared.events,
+                prepared.deferred_updates,
+                strict=True,
+            )
+        )
+    except RuntimeError:
+        raise DatabaseError("The notification preparation claim is stale or mismatched.") from None
+    event_ids = [projection[2] for projection in projections]
+    if len(event_ids) != len(set(event_ids)):
+        raise DatabaseError("Prepared event manuscript IDs must be unique.")
+    return projections
+
+
+def _durable_event_projections(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    reason: str,
+) -> tuple[tuple[int, int, str], ...]:
+    rows = conn.execute(
+        "SELECT observations.id AS observation_id, observations.tracking_period_id, "
+        "observations.present, manuscripts.external_id, "
+        "current_states.observation_id AS current_observation_id, "
+        "state_observations.check_id AS current_check_id "
+        "FROM observations JOIN tracking_periods "
+        "ON tracking_periods.id = observations.tracking_period_id "
+        "AND tracking_periods.manuscript_id = observations.manuscript_id "
+        "JOIN manuscripts ON manuscripts.id = observations.manuscript_id "
+        "LEFT JOIN current_states "
+        "ON current_states.tracking_period_id = observations.tracking_period_id "
+        "LEFT JOIN observations AS state_observations "
+        "ON state_observations.id = current_states.observation_id "
+        "WHERE observations.check_id = ? AND manuscripts.account_id = ? "
+        "ORDER BY manuscripts.external_id, observations.tracking_period_id",
+        (prepared.check_id, prepared.account_id),
+    ).fetchall()
+    if reason not in {"initial_verification", "manuscript_changes"}:
+        raise DatabaseError("The notification batch reason is invalid.")
+
+    projections: list[tuple[int, int, str]] = []
+    for row in rows:
+        observation_id = int(row["observation_id"])
+        current_observation_id = row["current_observation_id"]
+        current_check_id = row["current_check_id"]
+        if current_check_id is not None and int(current_check_id) > prepared.check_id:
+            raise DatabaseError("A newer check has already advanced a prepared projection.")
+        if reason == "initial_verification":
+            pending = bool(row["present"])
+        else:
+            pending = (current_observation_id is None and bool(row["present"])) or (
+                current_observation_id is not None and int(current_observation_id) != observation_id
+            )
+        if pending:
+            projections.append(
+                (
+                    int(row["tracking_period_id"]),
+                    observation_id,
+                    str(row["external_id"]),
+                )
+            )
+    return tuple(projections)
 
 
 def _validate_prepared_batch(
@@ -1180,13 +1271,10 @@ def _validate_prepared_batch(
         or batch.event_count != len(prepared.deferred_updates)
     ):
         raise DatabaseError("The notification preparation claim is stale or mismatched.")
-    try:
-        event_ids = tuple(event.external_id for event in prepared.events)
-    except RuntimeError:
-        raise DatabaseError("The notification preparation claim is stale or mismatched.") from None
-    deferred_ids = _validate_deferred_projections(conn, prepared)
-    if len(event_ids) != len(set(event_ids)) or set(event_ids) != set(deferred_ids):
-        raise DatabaseError("The deferred projections do not match the prepared events.")
+    prepared_projections = _prepared_event_projections(prepared)
+    durable_projections = _durable_event_projections(conn, prepared, str(row["reason"]))
+    if len(durable_projections) != batch.event_count or prepared_projections != durable_projections:
+        raise DatabaseError("Prepared events do not match the durable pending projections.")
 
 
 def commit_prepared_check(
