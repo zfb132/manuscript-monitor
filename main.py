@@ -47,6 +47,21 @@ BROWSER_KEYS = frozenset(
 )
 ACCOUNT_KEYS = frozenset({"name", "url", "username", "password", "manuscript_ids", "apprise_urls"})
 
+ENGLISH_MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+
 _MISSING = object()
 
 
@@ -54,6 +69,10 @@ class ConfigError(ValueError):
     def __init__(self, errors: Sequence[str]) -> None:
         self.errors = tuple(errors)
         super().__init__("Configuration is invalid:\n- " + "\n- ".join(self.errors))
+
+
+class DashboardParseError(ValueError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,12 +110,125 @@ class AppConfig:
     accounts: tuple[AccountConfig, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ManuscriptSnapshot:
+    external_id: str
+    title: str
+    submitted_text: str
+    submitted_date: date
+    status: str
+
+
 def normalize_whitespace(value: str) -> str:
     return " ".join(value.split())
 
 
 def normalize_manuscript_id(value: str) -> str:
     return normalize_whitespace(value.split("(", 1)[0])
+
+
+def parse_submitted_date(value: str) -> date:
+    parts = normalize_whitespace(value).split("-")
+    if len(parts) != 3 or parts[1] not in ENGLISH_MONTHS:
+        raise DashboardParseError("Submission date must use DD-Mon-YYYY.")
+    try:
+        return date(int(parts[2]), ENGLISH_MONTHS[parts[1]], int(parts[0]))
+    except ValueError as exc:
+        raise DashboardParseError("Submission date is invalid.") from exc
+
+
+def _dashboard_rows(table: Tag) -> list[Tag]:
+    tbody = table.find("tbody", recursive=False)
+    if isinstance(tbody, Tag):
+        return [row for row in tbody.find_all("tr", recursive=False) if isinstance(row, Tag)]
+
+    direct_rows = [row for row in table.find_all("tr", recursive=False) if isinstance(row, Tag)]
+    has_manuscript_row = any(
+        row.find("td", attrs={"data-label": True}, recursive=False) is not None
+        for row in direct_rows
+    )
+    if not has_manuscript_row:
+        raise DashboardParseError("Dashboard row structure is missing.")
+    return direct_rows
+
+
+def _dashboard_cell(row: Tag, label: str, row_number: int) -> Tag:
+    cell = row.find("td", attrs={"data-label": label}, recursive=False)
+    if not isinstance(cell, Tag):
+        raise DashboardParseError(f"Dashboard row {row_number} is missing the {label} cell.")
+    return cell
+
+
+def _required_dashboard_text(value: str, field: str, row_number: int) -> str:
+    normalized = normalize_whitespace(value)
+    if not normalized:
+        raise DashboardParseError(f"Dashboard row {row_number} has an empty {field} field.")
+    return normalized
+
+
+def parse_dashboard(html: str) -> tuple[ManuscriptSnapshot, ...]:
+    document = BeautifulSoup(html, "html.parser")
+    table = document.find("table", id="authorDashboardQueue")
+    if not isinstance(table, Tag):
+        raise DashboardParseError("Dashboard table #authorDashboardQueue is missing.")
+
+    snapshots: list[ManuscriptSnapshot] = []
+    seen_ids: set[str] = set()
+    for row_number, row in enumerate(_dashboard_rows(table), start=1):
+        status_cell = _dashboard_cell(row, "status", row_number)
+        status_element = status_cell.select_one("span.pagecontents")
+        if not isinstance(status_element, Tag):
+            raise DashboardParseError(f"Dashboard row {row_number} is missing its status value.")
+        status = _required_dashboard_text(
+            status_element.get_text(" ", strip=True),
+            "status",
+            row_number,
+        )
+
+        id_cell = _dashboard_cell(row, "ID", row_number)
+        external_id = normalize_manuscript_id(id_cell.get_text(" ", strip=True))
+        if not external_id:
+            raise DashboardParseError(f"Dashboard row {row_number} has an empty ID field.")
+        if external_id in seen_ids:
+            raise DashboardParseError(
+                f"Dashboard contains duplicate manuscript ID {external_id!r}."
+            )
+        seen_ids.add(external_id)
+
+        title_cell = _dashboard_cell(row, "title", row_number)
+        title_document = BeautifulSoup(str(title_cell), "html.parser")
+        for anchor in title_document.find_all("a"):
+            anchor.decompose()
+        title = _required_dashboard_text(
+            title_document.get_text(" ", strip=True),
+            "title",
+            row_number,
+        )
+
+        submitted_cell = _dashboard_cell(row, "submitted", row_number)
+        submitted_text = _required_dashboard_text(
+            submitted_cell.get_text(" ", strip=True),
+            "submitted",
+            row_number,
+        )
+        try:
+            submitted_date = parse_submitted_date(submitted_text)
+        except DashboardParseError as exc:
+            raise DashboardParseError(
+                f"Dashboard row {row_number} has an invalid submission date: {exc}"
+            ) from exc
+
+        snapshots.append(
+            ManuscriptSnapshot(
+                external_id=external_id,
+                title=title,
+                submitted_text=submitted_text,
+                submitted_date=submitted_date,
+                status=status,
+            )
+        )
+
+    return tuple(snapshots)
 
 
 def expand_environment(value: str, environ: Mapping[str, str]) -> str:
