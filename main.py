@@ -62,6 +62,192 @@ ENGLISH_MONTHS = {
     "Dec": 12,
 }
 
+SCHEMA_VERSION = 1
+
+SCHEMA_V1 = """
+CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE CHECK (length(trim(name)) > 0),
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+    needs_initial_notification INTEGER NOT NULL
+        CHECK (needs_initial_notification IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE account_configurations (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    url TEXT NOT NULL CHECK (length(trim(url)) > 0),
+    username TEXT NOT NULL CHECK (length(trim(username)) > 0),
+    track_all INTEGER NOT NULL CHECK (track_all IN (0, 1)),
+    active_from TEXT NOT NULL,
+    active_until TEXT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX account_configurations_one_active
+    ON account_configurations(account_id) WHERE active_until IS NULL;
+
+CREATE TABLE account_configuration_targets (
+    configuration_id INTEGER NOT NULL,
+    external_id TEXT NOT NULL CHECK (length(trim(external_id)) > 0),
+    PRIMARY KEY (configuration_id, external_id),
+    FOREIGN KEY (configuration_id)
+        REFERENCES account_configurations(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE checks (
+    id INTEGER PRIMARY KEY,
+    configuration_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('running', 'succeeded', 'failed')),
+    parsed_count INTEGER CHECK (parsed_count IS NULL OR parsed_count >= 0),
+    error_type TEXT,
+    error_message TEXT,
+    CHECK (
+        (outcome = 'running' AND completed_at IS NULL)
+        OR (outcome <> 'running' AND completed_at IS NOT NULL)
+    ),
+    FOREIGN KEY (configuration_id)
+        REFERENCES account_configurations(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE manuscripts (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    external_id TEXT NOT NULL CHECK (length(trim(external_id)) > 0),
+    created_at TEXT NOT NULL,
+    first_seen_at TEXT,
+    UNIQUE (account_id, external_id),
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE tracking_periods (
+    id INTEGER PRIMARY KEY,
+    manuscript_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    started_reason TEXT NOT NULL CHECK (
+        started_reason IN (
+            'account_activation',
+            'filter_addition',
+            'track_all_discovery',
+            'scope_reactivation'
+        )
+    ),
+    ended_reason TEXT CHECK (
+        ended_reason IS NULL
+        OR ended_reason IN ('account_removal', 'filter_removal')
+    ),
+    CHECK (
+        (ended_at IS NULL AND ended_reason IS NULL)
+        OR (ended_at IS NOT NULL AND ended_reason IS NOT NULL)
+    ),
+    UNIQUE (id, manuscript_id),
+    FOREIGN KEY (manuscript_id) REFERENCES manuscripts(id) ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX tracking_periods_one_active
+    ON tracking_periods(manuscript_id) WHERE ended_at IS NULL;
+
+CREATE TABLE observations (
+    id INTEGER PRIMARY KEY,
+    check_id INTEGER NOT NULL,
+    manuscript_id INTEGER NOT NULL,
+    tracking_period_id INTEGER NOT NULL,
+    present INTEGER NOT NULL CHECK (present IN (0, 1)),
+    title TEXT,
+    submitted_text TEXT,
+    submitted_date TEXT,
+    status TEXT,
+    observed_at TEXT NOT NULL,
+    CHECK (
+        (present = 1 AND title IS NOT NULL AND submitted_text IS NOT NULL
+            AND submitted_date IS NOT NULL AND status IS NOT NULL)
+        OR (present = 0 AND title IS NULL AND submitted_text IS NULL
+            AND submitted_date IS NULL AND status IS NULL)
+    ),
+    UNIQUE (check_id, tracking_period_id),
+    UNIQUE (id, tracking_period_id),
+    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE RESTRICT,
+    FOREIGN KEY (manuscript_id) REFERENCES manuscripts(id) ON DELETE RESTRICT,
+    FOREIGN KEY (tracking_period_id, manuscript_id)
+        REFERENCES tracking_periods(id, manuscript_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE current_states (
+    tracking_period_id INTEGER PRIMARY KEY,
+    observation_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (tracking_period_id)
+        REFERENCES tracking_periods(id) ON DELETE RESTRICT,
+    FOREIGN KEY (observation_id, tracking_period_id)
+        REFERENCES observations(id, tracking_period_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE notification_batches (
+    id INTEGER PRIMARY KEY,
+    check_id INTEGER NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('initial_verification', 'manuscript_changes')),
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    event_count INTEGER NOT NULL CHECK (event_count >= 0),
+    created_at TEXT NOT NULL,
+    committed_at TEXT,
+    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE RESTRICT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE notification_deliveries (
+    id INTEGER PRIMARY KEY,
+    batch_id INTEGER NOT NULL,
+    destination_index INTEGER NOT NULL CHECK (destination_index >= 0),
+    scheme TEXT NOT NULL CHECK (length(trim(scheme)) > 0),
+    attempted_at TEXT NOT NULL,
+    success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    error_type TEXT,
+    error_message TEXT,
+    UNIQUE (batch_id, destination_index),
+    FOREIGN KEY (batch_id)
+        REFERENCES notification_batches(id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER observations_account_matches_check
+BEFORE INSERT ON observations
+FOR EACH ROW
+WHEN (
+    SELECT account_configurations.account_id
+    FROM checks
+    JOIN account_configurations
+        ON account_configurations.id = checks.configuration_id
+    WHERE checks.id = NEW.check_id
+) <> (
+    SELECT manuscripts.account_id
+    FROM manuscripts
+    WHERE manuscripts.id = NEW.manuscript_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'observation account does not match check');
+END;
+
+CREATE TRIGGER notification_batch_account_matches_check
+BEFORE INSERT ON notification_batches
+FOR EACH ROW
+WHEN NEW.account_id <> (
+    SELECT account_configurations.account_id
+    FROM checks
+    JOIN account_configurations
+        ON account_configurations.id = checks.configuration_id
+    WHERE checks.id = NEW.check_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'notification batch account does not match check');
+END;
+
+PRAGMA user_version = 1;
+"""
+
 _MISSING = object()
 
 
@@ -72,6 +258,10 @@ class ConfigError(ValueError):
 
 
 class DashboardParseError(ValueError):
+    pass
+
+
+class DatabaseError(RuntimeError):
     pass
 
 
@@ -117,6 +307,52 @@ class ManuscriptSnapshot:
     submitted_text: str
     submitted_date: date
     status: str
+
+
+def utc_text(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("A timezone-aware timestamp is required.")
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def connect_database(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    connection.execute("PRAGMA journal_mode = DELETE")
+    return connection
+
+
+def migrate_database(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > SCHEMA_VERSION:
+        raise DatabaseError(
+            f"Database schema {version} is newer than supported schema {SCHEMA_VERSION}."
+        )
+    if version == 0:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V1 + "\nCOMMIT;")
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+
+
+def recover_interrupted_checks(conn: sqlite3.Connection, recovered_at: datetime) -> int:
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE checks
+            SET completed_at = ?,
+                outcome = 'failed',
+                error_type = 'InterruptedRun',
+                error_message = 'The previous check was interrupted before completion.'
+            WHERE outcome = 'running'
+            """,
+            (utc_text(recovered_at),),
+        )
+    return cursor.rowcount
 
 
 def normalize_whitespace(value: str) -> str:
