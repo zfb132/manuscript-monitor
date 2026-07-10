@@ -2010,11 +2010,14 @@ def load_config(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> AppConfig:
-    config_path = path.expanduser().resolve()
+    try:
+        config_path = path.expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError((f"Unable to load configuration: {type(exc).__name__}.",)) from exc
     try:
         with config_path.open("rb") as stream:
             raw = tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError((f"Unable to load configuration: {type(exc).__name__}.",)) from exc
     return parse_config(
         raw,
