@@ -795,8 +795,9 @@ def prepare_check(
     with conn:
         conn.execute("BEGIN IMMEDIATE")
         check_row = conn.execute(
-            "SELECT checks.configuration_id, checks.outcome, "
+            "SELECT checks.configuration_id, checks.outcome, checks.parsed_count, "
             "account_configurations.account_id, account_configurations.track_all, "
+            "account_configurations.active_until, "
             "EXISTS(SELECT 1 FROM observations WHERE observations.check_id = checks.id) "
             "AS has_observations, "
             "EXISTS(SELECT 1 FROM notification_batches "
@@ -811,10 +812,34 @@ def prepare_check(
             or int(check_row["configuration_id"]) != account.configuration_id
             or int(check_row["account_id"]) != account.account_id
             or bool(check_row["track_all"]) != account.config.track_all
+            or check_row["active_until"] is not None
         ):
             raise DatabaseError("The running check does not belong to the reconciled account.")
-        if bool(check_row["has_observations"]) or bool(check_row["has_batch"]):
+        if (
+            check_row["parsed_count"] is not None
+            or bool(check_row["has_observations"])
+            or bool(check_row["has_batch"])
+        ):
             raise DatabaseError("The running check has already been prepared.")
+        claim_cursor = conn.execute(
+            "UPDATE checks SET parsed_count = ? "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count IS NULL AND EXISTS ("
+            "SELECT 1 FROM account_configurations "
+            "WHERE account_configurations.id = checks.configuration_id "
+            "AND account_configurations.account_id = ? "
+            "AND account_configurations.track_all = ? "
+            "AND account_configurations.active_until IS NULL)",
+            (
+                parsed_count,
+                check_id,
+                account.configuration_id,
+                account.account_id,
+                int(account.config.track_all),
+            ),
+        )
+        if claim_cursor.rowcount != 1:
+            raise DatabaseError("The running check could not be claimed for preparation.")
 
         if account.config.track_all:
             current = parsed_by_id
@@ -974,16 +999,17 @@ def complete_check_without_notification(
         raise DatabaseError("A notification batch requires delivery finalization.")
     with conn:
         cursor = conn.execute(
-            "UPDATE checks SET completed_at = ?, outcome = 'succeeded', parsed_count = ?, "
+            "UPDATE checks SET completed_at = ?, outcome = 'succeeded', "
             "error_type = NULL, error_message = NULL "
             "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count = ? "
             "AND NOT EXISTS (SELECT 1 FROM notification_batches "
             "WHERE notification_batches.check_id = checks.id)",
             (
                 utc_text(completed_at),
-                prepared.parsed_count,
                 prepared.check_id,
                 prepared.configuration_id,
+                prepared.parsed_count,
             ),
         )
         if cursor.rowcount != 1:
