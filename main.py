@@ -363,6 +363,16 @@ class RedactedError:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliveryResult:
+    destination_index: int
+    scheme: str
+    attempted_at: datetime
+    success: bool
+    error_type: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectionUpdate:
     tracking_period_id: int
     observation_id: int
@@ -483,6 +493,80 @@ def build_notification(
         body="\n\n".join(sections),
         event_count=len(events),
     )
+
+
+def extract_apprise_scheme(url: str) -> str:
+    try:
+        candidate = urlsplit(url).scheme.lower()
+    except ValueError:
+        return "unknown"
+    return candidate if re.fullmatch(r"[a-z][a-z0-9+.-]*", candidate) else "unknown"
+
+
+def redact_exception(
+    exc: BaseException,
+    secrets: Iterable[str] = (),
+) -> RedactedError:
+    del secrets
+    return RedactedError(
+        type(exc).__name__,
+        "Operation failed; error details were suppressed.",
+    )
+
+
+def deliver_notifications(
+    destinations: Sequence[str],
+    title: str,
+    body: str,
+    *,
+    apprise_factory: Callable[[], Any] = apprise.Apprise,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> tuple[DeliveryResult, ...]:
+    results: list[DeliveryResult] = []
+    for index, destination in enumerate(destinations):
+        scheme = extract_apprise_scheme(destination)
+        try:
+            previous_disable_level = logging.root.manager.disable
+            logging.disable(logging.CRITICAL)
+            try:
+                notifier = apprise_factory()
+                added = bool(notifier.add(destination))
+                success = bool(notifier.notify(title=title, body=body)) if added else False
+            finally:
+                logging.disable(previous_disable_level)
+        except Exception as exc:
+            results.append(
+                DeliveryResult(
+                    index,
+                    scheme,
+                    clock(),
+                    False,
+                    type(exc).__name__,
+                    "Apprise delivery raised an exception.",
+                )
+            )
+            continue
+
+        if not added:
+            error_type = "InvalidDestination"
+            error_message = "Apprise rejected this destination."
+        elif not success:
+            error_type = "DeliveryFailed"
+            error_message = "Apprise reported a failed delivery."
+        else:
+            error_type = None
+            error_message = None
+        results.append(
+            DeliveryResult(
+                index,
+                scheme,
+                clock(),
+                success,
+                error_type,
+                error_message,
+            )
+        )
+    return tuple(results)
 
 
 def utc_text(value: datetime) -> str:
@@ -988,6 +1072,231 @@ def prepare_check(
         deferred_updates=tuple(deferred_updates),
         clear_initial_on_commit=account.needs_initial_notification,
     )
+
+
+def record_delivery(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    result: DeliveryResult,
+) -> None:
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO notification_deliveries("
+            "batch_id, destination_index, scheme, attempted_at, success, error_type, error_message"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                result.destination_index,
+                result.scheme,
+                utc_text(result.attempted_at),
+                int(result.success),
+                result.error_type,
+                result.error_message,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The delivery attempt could not be recorded.")
+
+
+def _validate_deferred_projections(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+) -> tuple[str, ...]:
+    period_ids = [update.tracking_period_id for update in prepared.deferred_updates]
+    if len(period_ids) != len(set(period_ids)):
+        raise DatabaseError("Deferred projection periods must be unique.")
+
+    external_ids: list[str] = []
+    for update in prepared.deferred_updates:
+        rows = conn.execute(
+            "SELECT manuscripts.external_id FROM observations "
+            "JOIN tracking_periods "
+            "ON tracking_periods.id = observations.tracking_period_id "
+            "JOIN manuscripts ON manuscripts.id = tracking_periods.manuscript_id "
+            "WHERE observations.id = ? AND observations.tracking_period_id = ? "
+            "AND observations.check_id = ? AND manuscripts.account_id = ?",
+            (
+                update.observation_id,
+                update.tracking_period_id,
+                prepared.check_id,
+                prepared.account_id,
+            ),
+        ).fetchall()
+        if len(rows) != 1:
+            raise DatabaseError("A deferred projection is stale or belongs to another check.")
+        external_ids.append(str(rows[0]["external_id"]))
+    return tuple(external_ids)
+
+
+def _validate_prepared_batch(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+) -> None:
+    batch = prepared.batch
+    if batch is None:
+        raise DatabaseError("No notification batch is available for finalization.")
+    row = conn.execute(
+        "SELECT notification_batches.check_id, "
+        "notification_batches.account_id AS batch_account_id, "
+        "notification_batches.reason, notification_batches.title, "
+        "notification_batches.body, notification_batches.event_count, "
+        "notification_batches.committed_at, checks.configuration_id, "
+        "checks.outcome, checks.parsed_count, "
+        "account_configurations.account_id AS configuration_account_id, "
+        "account_configurations.active_until, accounts.active AS account_active, "
+        "accounts.needs_initial_notification "
+        "FROM notification_batches "
+        "JOIN checks ON checks.id = notification_batches.check_id "
+        "JOIN account_configurations "
+        "ON account_configurations.id = checks.configuration_id "
+        "JOIN accounts ON accounts.id = account_configurations.account_id "
+        "WHERE notification_batches.id = ?",
+        (batch.id,),
+    ).fetchone()
+    if (
+        row is None
+        or int(row["check_id"]) != prepared.check_id
+        or int(row["batch_account_id"]) != prepared.account_id
+        or int(row["configuration_id"]) != prepared.configuration_id
+        or int(row["configuration_account_id"]) != prepared.account_id
+        or row["active_until"] is not None
+        or not bool(row["account_active"])
+        or row["outcome"] != "running"
+        or row["parsed_count"] is None
+        or int(row["parsed_count"]) != prepared.parsed_count
+        or row["committed_at"] is not None
+        or row["reason"] != batch.reason
+        or row["title"] != batch.title
+        or row["body"] != batch.body
+        or int(row["event_count"]) != batch.event_count
+    ):
+        raise DatabaseError("The prepared notification batch is stale or mismatched.")
+
+    stored_initial = row["reason"] == "initial_verification"
+    if (
+        stored_initial != prepared.clear_initial_on_commit
+        or bool(row["needs_initial_notification"]) != prepared.clear_initial_on_commit
+        or batch.event_count != len(prepared.events)
+        or batch.event_count != len(prepared.deferred_updates)
+    ):
+        raise DatabaseError("The notification preparation claim is stale or mismatched.")
+    try:
+        event_ids = tuple(event.external_id for event in prepared.events)
+    except RuntimeError:
+        raise DatabaseError("The notification preparation claim is stale or mismatched.") from None
+    deferred_ids = _validate_deferred_projections(conn, prepared)
+    if len(event_ids) != len(set(event_ids)) or set(event_ids) != set(deferred_ids):
+        raise DatabaseError("The deferred projections do not match the prepared events.")
+
+
+def commit_prepared_check(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    committed_at: datetime,
+) -> None:
+    if prepared.batch is None:
+        raise DatabaseError("No notification batch is available to commit.")
+    timestamp = utc_text(committed_at)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        succeeded = conn.execute(
+            "SELECT 1 FROM notification_deliveries WHERE batch_id = ? AND success = 1 LIMIT 1",
+            (prepared.batch.id,),
+        ).fetchone()
+        if succeeded is None:
+            raise DatabaseError(
+                "An uncommitted matching batch with a successful delivery is required."
+            )
+        _validate_prepared_batch(conn, prepared)
+        batch_cursor = conn.execute(
+            "UPDATE notification_batches SET committed_at = ? "
+            "WHERE id = ? AND check_id = ? AND account_id = ? AND committed_at IS NULL",
+            (timestamp, prepared.batch.id, prepared.check_id, prepared.account_id),
+        )
+        if batch_cursor.rowcount != 1:
+            raise DatabaseError("The notification batch is stale or mismatched.")
+
+        for update in prepared.deferred_updates:
+            state_cursor = conn.execute(
+                "INSERT INTO current_states(tracking_period_id, observation_id, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(tracking_period_id) DO UPDATE SET "
+                "observation_id = excluded.observation_id, updated_at = excluded.updated_at",
+                (update.tracking_period_id, update.observation_id, timestamp),
+            )
+            if state_cursor.rowcount != 1:
+                raise DatabaseError("A deferred projection could not be committed.")
+
+        if prepared.clear_initial_on_commit:
+            account_cursor = conn.execute(
+                "UPDATE accounts SET needs_initial_notification = 0, updated_at = ? "
+                "WHERE id = ? AND active = 1 AND needs_initial_notification = 1",
+                (timestamp, prepared.account_id),
+            )
+            if account_cursor.rowcount != 1:
+                raise DatabaseError("The account notification state is stale or mismatched.")
+
+        check_cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'succeeded', "
+            "error_type = NULL, error_message = NULL "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count = ? AND EXISTS ("
+            "SELECT 1 FROM account_configurations JOIN accounts "
+            "ON accounts.id = account_configurations.account_id "
+            "WHERE account_configurations.id = checks.configuration_id "
+            "AND account_configurations.account_id = ? "
+            "AND account_configurations.active_until IS NULL AND accounts.active = 1)",
+            (
+                timestamp,
+                prepared.check_id,
+                prepared.configuration_id,
+                prepared.parsed_count,
+                prepared.account_id,
+            ),
+        )
+        if check_cursor.rowcount != 1:
+            raise DatabaseError("The prepared check is stale or mismatched.")
+
+
+def fail_prepared_check(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    completed_at: datetime,
+    error: RedactedError,
+) -> None:
+    if prepared.batch is None:
+        raise DatabaseError("No notification batch is available to fail.")
+    timestamp = utc_text(completed_at)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        succeeded = conn.execute(
+            "SELECT 1 FROM notification_deliveries WHERE batch_id = ? AND success = 1 LIMIT 1",
+            (prepared.batch.id,),
+        ).fetchone()
+        if succeeded is not None:
+            raise DatabaseError("Only an uncommitted batch without a success may fail.")
+        _validate_prepared_batch(conn, prepared)
+        cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'failed', "
+            "error_type = ?, error_message = ? "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count = ? AND EXISTS ("
+            "SELECT 1 FROM account_configurations JOIN accounts "
+            "ON accounts.id = account_configurations.account_id "
+            "WHERE account_configurations.id = checks.configuration_id "
+            "AND account_configurations.account_id = ? "
+            "AND account_configurations.active_until IS NULL AND accounts.active = 1)",
+            (
+                timestamp,
+                error.error_type,
+                error.error_message,
+                prepared.check_id,
+                prepared.configuration_id,
+                prepared.parsed_count,
+                prepared.account_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The prepared check is stale or mismatched.")
 
 
 def complete_check_without_notification(
