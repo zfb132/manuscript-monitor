@@ -1,0 +1,32 @@
+[project]
+name = "check-submission-status"
+version = "0.1.0"
+description = "Monitor ScholarOne manuscript statuses and send Apprise notifications."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "apprise",
+  "beautifulsoup4",
+  "filelock",
+  "selenium",
+  "tomli; python_version < '3.11'",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "ruff",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]

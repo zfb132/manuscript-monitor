@@ -1,0 +1,19 @@
+[storage]
+# Relative paths are resolved from this file's directory.
+database_path = "data/submissions.db"
+
+[browser]
+headless = true
+element_timeout_seconds = 30
+page_load_timeout_seconds = 60
+# binary_path = "/optional/path/to/chrome"
+# driver_path = "/optional/path/to/chromedriver"
+
+[[accounts]]
+name = "primary"
+url = "https://mc.manuscriptcentral.com/tap-ieee"
+username = "${PRIMARY_SCHOLARONE_USERNAME}"
+password = "${PRIMARY_SCHOLARONE_PASSWORD}"
+# An empty list tracks every manuscript. Add short IDs to filter the dashboard.
+manuscript_ids = []
+apprise_urls = ["${PRIMARY_APPRISE_URL}"]

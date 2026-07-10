@@ -1,0 +1,5 @@
+apprise
+beautifulsoup4
+filelock
+selenium
+tomli; python_version < "3.11"

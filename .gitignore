@@ -165,3 +165,12 @@ cython_debug/
 
 # Local Git worktrees
 .worktrees/
+
+# Local project state and test fixtures
+/.env
+/.venv/
+/data/
+/demo.html
+/tests/
+/.superpowers/
+.ruff_cache/
