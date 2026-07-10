@@ -32,7 +32,8 @@ The only production Python source file will be `main.py`. Local execution always
 - `config.toml` will not contain scheduling fields.
 - Title-only or submission-date-only changes will be stored but will not trigger notifications.
 - Failed Apprise destinations will not be retried after another destination succeeds.
-- ScholarOne passwords and complete Apprise URLs will never be stored in SQLite or logs.
+- ScholarOne passwords and user-supplied Apprise destinations will never be stored in SQLite or
+  logs.
 - Removing an account or manuscript ID from `config.toml` will not send a notification.
 - Unit-test files and HTML fixtures will not be tracked.
 
@@ -125,8 +126,8 @@ username = "${SECONDARY_SCHOLARONE_USERNAME}"
 password = "${SECONDARY_SCHOLARONE_PASSWORD}"
 manuscript_ids = ["AP2606-1126", "AP2606-1287"]
 apprise_urls = [
-  "tgram://bot-token/chat-id",
-  "mailto://user:password@example.com",
+  "${SECONDARY_APPRISE_URL_1}",
+  "${SECONDARY_APPRISE_URL_2}",
 ]
 ```
 
@@ -275,7 +276,8 @@ The Selenium flow is:
 5. Wait for the author navigation link, normalize its text, and enter `Author`.
 6. Wait for `table#authorDashboardQueue`.
 7. Capture `driver.page_source`.
-8. Always call `driver.quit()` in `finally`.
+8. Always call `driver.quit()` in `finally`. If post-construction setup fails before the session is
+   returned, the constructor helper owns that cleanup.
 
 Driver and browser path precedence is:
 
@@ -290,9 +292,10 @@ Headless mode defaults to enabled. Browser construction uses platform-neutral pa
 BeautifulSoup uses Python's built-in `html.parser`, so `lxml` is not required. Parsing is row-scoped:
 
 1. Find `table#authorDashboardQueue`.
-2. Require its `tbody`.
-3. Iterate direct manuscript `tr` children.
-4. Within each row, locate the relevant `td[data-label]` cells.
+2. Use every direct row from its `tbody` when present.
+3. Fall back to every direct table `tr` child because ScholarOne source may legally omit the
+   optional opening `tbody` tag, but only when at least one direct manuscript row exists.
+4. Validate every selected row so malformed rows cannot be silently discarded before filtering.
 
 Field rules:
 
@@ -302,7 +305,10 @@ Field rules:
 - Submission text is `td[data-label="submitted"]`; the display text is retained and English `DD-Mon-YYYY` is normalized to ISO `YYYY-MM-DD` without host-locale dependence.
 - Every value is stripped and internal whitespace is collapsed.
 
-A present row with a missing or empty required field, invalid date, or duplicate ID invalidates the entire account parse. A present table with a valid empty `tbody` is a successful zero-manuscript result. A missing table is an error, not an empty result. Filtering occurs only after the complete table parses successfully.
+A manuscript row with a missing or empty required field, invalid date, or duplicate ID invalidates
+the entire account parse. A present table with an empty `tbody` is a successful zero-manuscript
+result. A missing table, or a no-`tbody` table without a direct manuscript row, is an error rather
+than an empty result. Filtering occurs only after the complete table parses successfully.
 
 ## Difference Semantics
 
@@ -328,9 +334,16 @@ Each destination is loaded and notified separately. The batch commits when any d
 
 Complete messages are not truncated for provider-specific limits. One provider may fail while another succeeds.
 
+Arbitrary Apprise exception text is never persisted. Failures store fixed English messages and safe
+error types, and third-party logging is disabled only around each Apprise call and then restored so
+decoded or normalized credential fragments cannot bypass redaction.
+
 ## Transactions and Failures
 
-The process acquires a cross-platform file lock adjacent to the database before initialization and holds it for the invocation. A conflict fails instead of overlapping another run.
+The process creates the database parent directory and acquires a cross-platform file lock adjacent
+to the database inside the protected runtime boundary, then holds it for the invocation. A path,
+lock-construction, or lock-acquisition failure returns exit code `1`; a conflict fails instead of
+overlapping another run.
 
 For each account:
 
@@ -339,7 +352,8 @@ For each account:
 3. Insert manuscripts, tracking changes, and observations and calculate the proposed batch in a short transaction.
 4. Send each destination outside the database transaction.
 5. Record each delivery.
-6. If any succeeds, atomically commit the batch, clear the initial flag when applicable, and advance affected current states.
+6. If any succeeds, atomically commit the batch, verify every deferred observation belongs to this
+   check/account, clear the initial flag when applicable, and advance affected current states.
 7. If all fail, leave notification-bearing projections unchanged.
 8. Mark the check succeeded or failed with a redacted result.
 
@@ -401,7 +415,7 @@ tests/test_notifications.py
 tests/test_workflow.py
 ```
 
-`demo.html` contains the approved ScholarOne table structure. Ignored tests cover configuration, parsing, malformed pages, database migrations, every transition, configuration reconciliation, notification success policies, message completeness, secret redaction, browser cleanup, account isolation, exit codes, and file locking.
+`demo.html` is a browser-saved view-source wrapper around the approved ScholarOne table. An ignored test-only helper reconstructs the original source from its `td.line-content` rows before calling the production parser; production code contains no fixture-specific branch. Ignored tests cover configuration, parsing, malformed pages, database migrations, every transition, configuration reconciliation, notification success policies, message completeness, secret redaction, browser cleanup, account isolation, exit codes, and file locking.
 
 Final local verification commands are:
 
