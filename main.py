@@ -318,6 +318,173 @@ class ManuscriptSnapshot:
     status: str
 
 
+class EventType(str, Enum):
+    CURRENT = "CURRENT"
+    NEW = "NEW"
+    STATUS_CHANGED = "STATUS_CHANGED"
+    DISAPPEARED = "DISAPPEARED"
+    REAPPEARED = "REAPPEARED"
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedState:
+    tracking_period_id: int
+    observation_id: int
+    present: bool
+    snapshot: ManuscriptSnapshot | None
+
+
+@dataclass(frozen=True, slots=True)
+class ManuscriptEvent:
+    kind: EventType
+    current: ManuscriptSnapshot | None
+    previous: ManuscriptSnapshot | None
+
+    @property
+    def external_id(self) -> str:
+        snapshot = self.current or self.previous
+        if snapshot is None:
+            raise RuntimeError("A manuscript event requires a snapshot.")
+        return snapshot.external_id
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationMessage:
+    reason: str
+    title: str
+    body: str
+    event_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class RedactedError:
+    error_type: str
+    error_message: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionUpdate:
+    tracking_period_id: int
+    observation_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoredNotificationBatch:
+    id: int
+    title: str
+    body: str
+    event_count: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCheck:
+    check_id: int
+    account_id: int
+    configuration_id: int
+    parsed_count: int
+    events: tuple[ManuscriptEvent, ...]
+    batch: StoredNotificationBatch | None
+    deferred_updates: tuple[ProjectionUpdate, ...]
+    clear_initial_on_commit: bool
+
+
+def calculate_events(
+    current: Mapping[str, ManuscriptSnapshot],
+    accepted: Mapping[str, AcceptedState],
+    *,
+    initial_verification: bool,
+) -> tuple[ManuscriptEvent, ...]:
+    events: list[ManuscriptEvent] = []
+    for external_id in sorted(set(current) | set(accepted)):
+        current_snapshot = current.get(external_id)
+        previous = accepted.get(external_id)
+        if initial_verification and current_snapshot is not None:
+            kind = EventType.CURRENT
+        elif previous is None and current_snapshot is not None:
+            kind = EventType.NEW
+        elif previous is not None and previous.present and current_snapshot is None:
+            kind = EventType.DISAPPEARED
+        elif previous is not None and not previous.present and current_snapshot is not None:
+            kind = EventType.REAPPEARED
+        elif (
+            previous is not None
+            and previous.present
+            and previous.snapshot is not None
+            and current_snapshot is not None
+            and previous.snapshot.status != current_snapshot.status
+        ):
+            kind = EventType.STATUS_CHANGED
+        else:
+            continue
+        events.append(
+            ManuscriptEvent(
+                kind=kind,
+                current=current_snapshot,
+                previous=None if previous is None else previous.snapshot,
+            )
+        )
+    return tuple(events)
+
+
+def _notification_event_lines(event: ManuscriptEvent) -> list[str]:
+    snapshot = event.current or event.previous
+    if snapshot is None:
+        raise RuntimeError("A manuscript event requires a snapshot.")
+    lines = [
+        f"Event: {event.kind.value}",
+        f"ID: {event.external_id}",
+        f"Title: {snapshot.title}",
+        f"Submitted: {snapshot.submitted_text}",
+    ]
+    if event.kind is EventType.STATUS_CHANGED:
+        if event.previous is None or event.current is None:
+            raise RuntimeError("A status change requires previous and current snapshots.")
+        lines.extend(
+            (
+                f"Previous status: {event.previous.status}",
+                f"Current status: {event.current.status}",
+            )
+        )
+    elif event.kind is EventType.DISAPPEARED:
+        lines.append(f"Last known status: {snapshot.status}")
+    else:
+        lines.append(f"Status: {snapshot.status}")
+    return lines
+
+
+def build_notification(
+    account_name: str,
+    checked_at: datetime,
+    events: Sequence[ManuscriptEvent],
+    *,
+    initial_verification: bool,
+) -> NotificationMessage | None:
+    if not events and not initial_verification:
+        return None
+
+    reason = "initial_verification" if initial_verification else "manuscript_changes"
+    title = (
+        f"Submission status verification for {account_name}"
+        if initial_verification
+        else f"Submission status changes for {account_name}"
+    )
+    sections = [f"Account: {account_name}\nChecked at: {utc_text(checked_at)}"]
+    if events:
+        sections.extend(
+            "\n".join(_notification_event_lines(event))
+            for event in sorted(events, key=lambda event: event.external_id)
+        )
+    else:
+        sections.append("No manuscripts were found in the current scope.")
+    return NotificationMessage(
+        reason=reason,
+        title=title,
+        body="\n\n".join(sections),
+        event_count=len(events),
+    )
+
+
 def utc_text(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("A timezone-aware timestamp is required.")
@@ -568,6 +735,275 @@ def reconcile_configuration(
             )
 
     return reconciled
+
+
+def start_check(
+    conn: sqlite3.Connection,
+    configuration_id: int,
+    started_at: datetime,
+) -> int:
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO checks(configuration_id, started_at, outcome) "
+            "SELECT id, ?, 'running' FROM account_configurations "
+            "WHERE id = ? AND active_until IS NULL",
+            (utc_text(started_at), configuration_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The active account configuration was not found.")
+    return int(cursor.lastrowid)
+
+
+def _accepted_snapshot(row: sqlite3.Row) -> ManuscriptSnapshot | None:
+    if not bool(row["accepted_present"]):
+        return None
+    return ManuscriptSnapshot(
+        external_id=row["external_id"],
+        title=row["accepted_title"],
+        submitted_text=row["accepted_submitted_text"],
+        submitted_date=date.fromisoformat(row["accepted_submitted_date"]),
+        status=row["accepted_status"],
+    )
+
+
+def _upsert_current_state(
+    conn: sqlite3.Connection,
+    update: ProjectionUpdate,
+    updated_at: str,
+) -> None:
+    cursor = conn.execute(
+        "INSERT INTO current_states(tracking_period_id, observation_id, updated_at) "
+        "VALUES (?, ?, ?) ON CONFLICT(tracking_period_id) DO UPDATE SET "
+        "observation_id = excluded.observation_id, updated_at = excluded.updated_at",
+        (update.tracking_period_id, update.observation_id, updated_at),
+    )
+    if cursor.rowcount != 1:
+        raise DatabaseError("The current state could not be updated.")
+
+
+def prepare_check(
+    conn: sqlite3.Connection,
+    account: ReconciledAccount,
+    check_id: int,
+    parsed: Sequence[ManuscriptSnapshot],
+    observed_at: datetime,
+) -> PreparedCheck:
+    observed_text = utc_text(observed_at)
+    parsed_count = len(parsed)
+    parsed_by_id = {snapshot.external_id: snapshot for snapshot in parsed}
+
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        check_row = conn.execute(
+            "SELECT checks.configuration_id, checks.outcome, "
+            "account_configurations.account_id, account_configurations.track_all, "
+            "EXISTS(SELECT 1 FROM observations WHERE observations.check_id = checks.id) "
+            "AS has_observations, "
+            "EXISTS(SELECT 1 FROM notification_batches "
+            "WHERE notification_batches.check_id = checks.id) AS has_batch "
+            "FROM checks JOIN account_configurations "
+            "ON account_configurations.id = checks.configuration_id WHERE checks.id = ?",
+            (check_id,),
+        ).fetchone()
+        if (
+            check_row is None
+            or check_row["outcome"] != "running"
+            or int(check_row["configuration_id"]) != account.configuration_id
+            or int(check_row["account_id"]) != account.account_id
+            or bool(check_row["track_all"]) != account.config.track_all
+        ):
+            raise DatabaseError("The running check does not belong to the reconciled account.")
+        if bool(check_row["has_observations"]) or bool(check_row["has_batch"]):
+            raise DatabaseError("The running check has already been prepared.")
+
+        if account.config.track_all:
+            current = parsed_by_id
+            for external_id in sorted(current):
+                manuscript_id = _get_or_create_manuscript(
+                    conn,
+                    account.account_id,
+                    external_id,
+                    observed_text,
+                )
+                _open_tracking_period(
+                    conn,
+                    manuscript_id,
+                    observed_text,
+                    "track_all_discovery",
+                )
+        else:
+            current = {
+                external_id: snapshot
+                for external_id, snapshot in parsed_by_id.items()
+                if external_id in account.target_ids
+            }
+
+        period_rows = conn.execute(
+            "SELECT tracking_periods.id AS tracking_period_id, "
+            "manuscripts.id AS manuscript_id, manuscripts.external_id, "
+            "current_states.observation_id AS accepted_observation_id, "
+            "accepted_observations.present AS accepted_present, "
+            "accepted_observations.title AS accepted_title, "
+            "accepted_observations.submitted_text AS accepted_submitted_text, "
+            "accepted_observations.submitted_date AS accepted_submitted_date, "
+            "accepted_observations.status AS accepted_status "
+            "FROM tracking_periods "
+            "JOIN manuscripts ON manuscripts.id = tracking_periods.manuscript_id "
+            "LEFT JOIN current_states "
+            "ON current_states.tracking_period_id = tracking_periods.id "
+            "LEFT JOIN observations AS accepted_observations "
+            "ON accepted_observations.id = current_states.observation_id "
+            "WHERE manuscripts.account_id = ? AND tracking_periods.ended_at IS NULL "
+            "ORDER BY manuscripts.external_id",
+            (account.account_id,),
+        ).fetchall()
+
+        accepted: dict[str, AcceptedState] = {}
+        for row in period_rows:
+            if row["accepted_observation_id"] is None:
+                continue
+            accepted[row["external_id"]] = AcceptedState(
+                tracking_period_id=int(row["tracking_period_id"]),
+                observation_id=int(row["accepted_observation_id"]),
+                present=bool(row["accepted_present"]),
+                snapshot=_accepted_snapshot(row),
+            )
+
+        observation_updates: dict[str, ProjectionUpdate] = {}
+        for row in period_rows:
+            external_id = row["external_id"]
+            snapshot = current.get(external_id)
+            if snapshot is None:
+                values: tuple[object, ...] = (0, None, None, None, None)
+            else:
+                values = (
+                    1,
+                    snapshot.title,
+                    snapshot.submitted_text,
+                    snapshot.submitted_date.isoformat(),
+                    snapshot.status,
+                )
+                cursor = conn.execute(
+                    "UPDATE manuscripts SET first_seen_at = COALESCE(first_seen_at, ?) "
+                    "WHERE id = ?",
+                    (observed_text, row["manuscript_id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise DatabaseError("The observed manuscript was not found.")
+            cursor = conn.execute(
+                "INSERT INTO observations(check_id, manuscript_id, tracking_period_id, "
+                "present, title, submitted_text, submitted_date, status, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    check_id,
+                    row["manuscript_id"],
+                    row["tracking_period_id"],
+                    *values,
+                    observed_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("The manuscript observation could not be stored.")
+            observation_updates[external_id] = ProjectionUpdate(
+                tracking_period_id=int(row["tracking_period_id"]),
+                observation_id=int(cursor.lastrowid),
+            )
+
+        events = calculate_events(
+            current,
+            accepted,
+            initial_verification=account.needs_initial_notification,
+        )
+        event_ids = {event.external_id for event in events}
+        deferred_updates: list[ProjectionUpdate] = []
+        for external_id, update in observation_updates.items():
+            if external_id in event_ids:
+                deferred_updates.append(update)
+            elif external_id in accepted or external_id in current:
+                _upsert_current_state(conn, update, observed_text)
+
+        message = build_notification(
+            account.config.name,
+            observed_at,
+            events,
+            initial_verification=account.needs_initial_notification,
+        )
+        batch: StoredNotificationBatch | None = None
+        if message is not None:
+            cursor = conn.execute(
+                "INSERT INTO notification_batches(check_id, account_id, reason, title, body, "
+                "event_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    check_id,
+                    account.account_id,
+                    message.reason,
+                    message.title,
+                    message.body,
+                    message.event_count,
+                    observed_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("The notification batch could not be stored.")
+            batch = StoredNotificationBatch(
+                id=int(cursor.lastrowid),
+                title=message.title,
+                body=message.body,
+                event_count=message.event_count,
+                reason=message.reason,
+            )
+
+    return PreparedCheck(
+        check_id=check_id,
+        account_id=account.account_id,
+        configuration_id=account.configuration_id,
+        parsed_count=parsed_count,
+        events=events,
+        batch=batch,
+        deferred_updates=tuple(deferred_updates),
+        clear_initial_on_commit=account.needs_initial_notification,
+    )
+
+
+def complete_check_without_notification(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    completed_at: datetime,
+) -> None:
+    if prepared.batch is not None:
+        raise DatabaseError("A notification batch requires delivery finalization.")
+    with conn:
+        cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'succeeded', parsed_count = ?, "
+            "error_type = NULL, error_message = NULL "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND NOT EXISTS (SELECT 1 FROM notification_batches "
+            "WHERE notification_batches.check_id = checks.id)",
+            (
+                utc_text(completed_at),
+                prepared.parsed_count,
+                prepared.check_id,
+                prepared.configuration_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The prepared check is no longer running.")
+
+
+def fail_check(
+    conn: sqlite3.Connection,
+    check_id: int,
+    completed_at: datetime,
+    error: RedactedError,
+) -> None:
+    with conn:
+        cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'failed', error_type = ?, "
+            "error_message = ? WHERE id = ? AND outcome = 'running'",
+            (utc_text(completed_at), error.error_type, error.error_message, check_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The check is no longer running.")
 
 
 def normalize_whitespace(value: str) -> str:
