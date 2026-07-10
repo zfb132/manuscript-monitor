@@ -599,10 +599,17 @@ def utc_text(value: datetime) -> str:
 def connect_database(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 5000")
-    connection.execute("PRAGMA journal_mode = DELETE")
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = DELETE")
+    except BaseException:
+        try:
+            connection.close()
+        except Exception:
+            LOGGER.warning("Database cleanup failed during connection initialization.")
+        raise
     return connection
 
 
@@ -2014,3 +2021,146 @@ def load_config(
         config_dir=config_path.parent,
         environ=os.environ if environ is None else environ,
     )
+
+
+def check_account(
+    conn: sqlite3.Connection,
+    account: ReconciledAccount,
+    browser: BrowserConfig,
+    *,
+    environ: Mapping[str, str],
+    driver_factory: Callable[..., Any],
+    wait_factory: Callable[..., Any],
+    apprise_factory: Callable[[], Any],
+    clock: Callable[[], datetime],
+) -> bool:
+    check_id = start_check(conn, account.configuration_id, clock())
+    try:
+        html = capture_dashboard_html(
+            account.config,
+            browser,
+            environ=environ,
+            driver_factory=driver_factory,
+            wait_factory=wait_factory,
+        )
+        parsed = parse_dashboard(html)
+        prepared = prepare_check(conn, account, check_id, parsed, clock())
+    except (BrowserCaptureError, DashboardParseError) as exc:
+        error = redact_exception(
+            exc,
+            (account.config.password, *account.config.apprise_urls),
+        )
+        fail_check(conn, check_id, clock(), error)
+        LOGGER.error(
+            "Account %s failed during capture or parsing: %s",
+            account.config.name,
+            error.error_type,
+        )
+        return False
+
+    if prepared.batch is None:
+        complete_check_without_notification(conn, prepared, clock())
+        return True
+
+    results = deliver_notifications(
+        account.config.apprise_urls,
+        prepared.batch.title,
+        prepared.batch.body,
+        apprise_factory=apprise_factory,
+        clock=clock,
+    )
+    for result in results:
+        record_delivery(conn, prepared.batch.id, result)
+    if any(result.success for result in results):
+        commit_prepared_check(conn, prepared, clock())
+        return True
+
+    fail_prepared_check(
+        conn,
+        prepared,
+        clock(),
+        RedactedError(
+            "NotificationDeliveryError",
+            "Every Apprise destination failed.",
+        ),
+    )
+    LOGGER.error(
+        "Account %s failed because every notification destination failed.",
+        account.config.name,
+    )
+    return False
+
+
+def run_once(
+    config: AppConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+    driver_factory: Callable[..., Any] = create_chrome_driver,
+    wait_factory: Callable[..., Any] = WebDriverWait,
+    apprise_factory: Callable[[], Any] = apprise.Apprise,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> int:
+    runtime_environment = os.environ if environ is None else environ
+    database_path = config.storage.database_path
+    try:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(f"{database_path}.lock", timeout=0)
+        with lock:
+            conn = connect_database(database_path)
+            try:
+                migrate_database(conn)
+                recover_interrupted_checks(conn, clock())
+                reconciled = reconcile_configuration(conn, config.accounts, clock())
+                outcomes = [
+                    check_account(
+                        conn,
+                        reconciled[account.name],
+                        config.browser,
+                        environ=runtime_environment,
+                        driver_factory=driver_factory,
+                        wait_factory=wait_factory,
+                        apprise_factory=apprise_factory,
+                        clock=clock,
+                    )
+                    for account in config.accounts
+                ]
+                return 0 if all(outcomes) else 1
+            finally:
+                conn.close()
+    except FileLockTimeout:
+        LOGGER.error("Another check is already using the configured database.")
+        return 1
+    except (OSError, sqlite3.Error, DatabaseError):
+        LOGGER.error("The database or process lock operation failed.")
+        return 1
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Check ScholarOne manuscript statuses once and send Apprise notifications."
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.toml"),
+        help="Path to config.toml (default: ./config.toml).",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        LOGGER.error("%s", exc)
+        return 2
+    return run_once(config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
