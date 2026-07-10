@@ -278,6 +278,10 @@ class DashboardParseError(ValueError):
     pass
 
 
+class BrowserCaptureError(RuntimeError):
+    pass
+
+
 class DatabaseError(RuntimeError):
     pass
 
@@ -1427,6 +1431,86 @@ def fail_check(
         )
         if cursor.rowcount != 1:
             raise DatabaseError("The check is no longer running.")
+
+
+def create_chrome_driver(
+    config: BrowserConfig,
+    environ: Mapping[str, str],
+) -> Any:
+    options = webdriver.ChromeOptions()
+    if config.headless:
+        options.add_argument("--headless=new")
+    binary = config.binary_path or (
+        Path(environ["CHROME_BIN"]) if environ.get("CHROME_BIN") else None
+    )
+    if binary is not None:
+        options.binary_location = str(binary)
+    if environ.get("RUNNING_IN_DOCKER") == "1":
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+
+    driver_path = config.driver_path or (
+        Path(environ["CHROMEDRIVER_PATH"]) if environ.get("CHROMEDRIVER_PATH") else None
+    )
+    kwargs: dict[str, Any] = {"options": options}
+    if driver_path is not None:
+        kwargs["service"] = Service(executable_path=str(driver_path))
+    driver = webdriver.Chrome(**kwargs)
+    try:
+        driver.set_page_load_timeout(config.page_load_timeout_seconds)
+    except Exception:
+        try:
+            driver.quit()
+        except Exception:
+            LOGGER.warning("Browser cleanup failed during driver initialization.")
+        raise
+    return driver
+
+
+def capture_dashboard_html(
+    account: AccountConfig,
+    browser: BrowserConfig,
+    *,
+    environ: Mapping[str, str],
+    driver_factory: Callable[[BrowserConfig, Mapping[str, str]], Any] = create_chrome_driver,
+    wait_factory: Callable[[Any, int], Any] = WebDriverWait,
+) -> str:
+    driver: Any | None = None
+    try:
+        driver = driver_factory(browser, environ)
+        driver.get(account.url)
+        wait = wait_factory(driver, browser.element_timeout_seconds)
+        username = wait.until(EC.presence_of_element_located((By.NAME, "USERID")))
+        username.clear()
+        username.send_keys(account.username)
+        password = wait.until(EC.presence_of_element_located((By.NAME, "PASSWORD")))
+        password.clear()
+        password.send_keys(account.password)
+        login = wait.until(EC.element_to_be_clickable((By.ID, "logInButton")))
+        driver.execute_script("arguments[0].click();", login)
+
+        def find_author(current_driver: Any) -> Any:
+            for link in current_driver.find_elements(By.CSS_SELECTOR, "li.nav-link a"):
+                if normalize_whitespace(link.text) == "Author":
+                    return link
+            return False
+
+        author = wait.until(find_author)
+        href = author.get_attribute("href") or ""
+        if href.lower().startswith("javascript:"):
+            driver.execute_script(href.split(":", 1)[1])
+        else:
+            author.click()
+        wait.until(EC.presence_of_element_located((By.ID, "authorDashboardQueue")))
+        return driver.page_source
+    except Exception as exc:
+        raise BrowserCaptureError(f"Browser capture failed with {type(exc).__name__}.") from exc
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                LOGGER.warning("Browser cleanup failed for account %s.", account.name)
 
 
 def normalize_whitespace(value: str) -> str:
