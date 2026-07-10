@@ -294,6 +294,15 @@ class AccountConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ReconciledAccount:
+    account_id: int
+    configuration_id: int
+    config: AccountConfig
+    target_ids: frozenset[str]
+    needs_initial_notification: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     storage: StorageConfig
     browser: BrowserConfig
@@ -353,6 +362,212 @@ def recover_interrupted_checks(conn: sqlite3.Connection, recovered_at: datetime)
             (utc_text(recovered_at),),
         )
     return cursor.rowcount
+
+
+def _get_or_create_manuscript(
+    conn: sqlite3.Connection,
+    account_id: int,
+    external_id: str,
+    created_at: str,
+) -> int:
+    row = conn.execute(
+        "SELECT id FROM manuscripts WHERE account_id = ? AND external_id = ?",
+        (account_id, external_id),
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = conn.execute(
+        "INSERT INTO manuscripts(account_id, external_id, created_at) VALUES (?, ?, ?)",
+        (account_id, external_id, created_at),
+    )
+    return int(cursor.lastrowid)
+
+
+def _open_tracking_period(
+    conn: sqlite3.Connection,
+    manuscript_id: int,
+    started_at: str,
+    reason: str,
+) -> int:
+    row = conn.execute(
+        "SELECT id FROM tracking_periods WHERE manuscript_id = ? AND ended_at IS NULL",
+        (manuscript_id,),
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = conn.execute(
+        "INSERT INTO tracking_periods(manuscript_id, started_at, started_reason) VALUES (?, ?, ?)",
+        (manuscript_id, started_at, reason),
+    )
+    return int(cursor.lastrowid)
+
+
+def _close_active_periods(
+    conn: sqlite3.Connection,
+    account_id: int,
+    ended_at: str,
+    reason: str,
+    *,
+    keep_external_ids: AbstractSet[str] = frozenset(),
+) -> None:
+    rows = conn.execute(
+        "SELECT tracking_periods.id, manuscripts.external_id "
+        "FROM tracking_periods "
+        "JOIN manuscripts ON manuscripts.id = tracking_periods.manuscript_id "
+        "WHERE manuscripts.account_id = ? AND tracking_periods.ended_at IS NULL",
+        (account_id,),
+    ).fetchall()
+    for row in rows:
+        if row["external_id"] in keep_external_ids:
+            continue
+        conn.execute(
+            "UPDATE tracking_periods SET ended_at = ?, ended_reason = ? WHERE id = ?",
+            (ended_at, reason, row["id"]),
+        )
+
+
+def reconcile_configuration(
+    conn: sqlite3.Connection,
+    accounts: Sequence[AccountConfig],
+    now: datetime,
+) -> dict[str, ReconciledAccount]:
+    reconciled: dict[str, ReconciledAccount] = {}
+    configured_names = {account.name for account in accounts}
+    changed_at = utc_text(now)
+
+    with conn:
+        account_rows = conn.execute(
+            "SELECT id, name, active, needs_initial_notification FROM accounts"
+        ).fetchall()
+        for row in account_rows:
+            if row["name"] in configured_names:
+                continue
+            account_id = int(row["id"])
+            if bool(row["active"]) or bool(row["needs_initial_notification"]):
+                conn.execute(
+                    "UPDATE accounts SET active = ?, needs_initial_notification = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (0, 0, changed_at, account_id),
+                )
+            conn.execute(
+                "UPDATE account_configurations SET active_until = ? "
+                "WHERE account_id = ? AND active_until IS NULL",
+                (changed_at, account_id),
+            )
+            _close_active_periods(conn, account_id, changed_at, "account_removal")
+
+        for config in accounts:
+            target_ids = frozenset(config.manuscript_ids)
+            account_row = conn.execute(
+                "SELECT id, active, needs_initial_notification FROM accounts WHERE name = ?",
+                (config.name,),
+            ).fetchone()
+            is_new = account_row is None
+            is_reactivated = account_row is not None and not bool(account_row["active"])
+            if account_row is None:
+                cursor = conn.execute(
+                    "INSERT INTO accounts(name, active, needs_initial_notification, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (config.name, 1, 1, changed_at, changed_at),
+                )
+                account_id = int(cursor.lastrowid)
+                needs_initial_notification = True
+            else:
+                account_id = int(account_row["id"])
+                needs_initial_notification = bool(account_row["needs_initial_notification"])
+                if is_reactivated:
+                    needs_initial_notification = True
+                    conn.execute(
+                        "UPDATE accounts SET active = ?, needs_initial_notification = ?, "
+                        "updated_at = ? WHERE id = ?",
+                        (1, 1, changed_at, account_id),
+                    )
+
+            active_configuration = conn.execute(
+                "SELECT id, url, username, track_all FROM account_configurations "
+                "WHERE account_id = ? AND active_until IS NULL",
+                (account_id,),
+            ).fetchone()
+            configuration_id: int | None = None
+            if active_configuration is not None:
+                configuration_id = int(active_configuration["id"])
+                stored_targets = frozenset(
+                    row["external_id"]
+                    for row in conn.execute(
+                        "SELECT external_id FROM account_configuration_targets "
+                        "WHERE configuration_id = ?",
+                        (configuration_id,),
+                    ).fetchall()
+                )
+                identical = (
+                    active_configuration["url"] == config.url
+                    and active_configuration["username"] == config.username
+                    and bool(active_configuration["track_all"]) == config.track_all
+                    and stored_targets == target_ids
+                )
+                if not identical:
+                    conn.execute(
+                        "UPDATE account_configurations SET active_until = ? WHERE id = ?",
+                        (changed_at, configuration_id),
+                    )
+                    configuration_id = None
+
+            if configuration_id is None:
+                cursor = conn.execute(
+                    "INSERT INTO account_configurations(account_id, url, username, track_all, "
+                    "active_from) VALUES (?, ?, ?, ?, ?)",
+                    (account_id, config.url, config.username, int(config.track_all), changed_at),
+                )
+                configuration_id = int(cursor.lastrowid)
+                for external_id in sorted(target_ids):
+                    conn.execute(
+                        "INSERT INTO account_configuration_targets(configuration_id, external_id) "
+                        "VALUES (?, ?)",
+                        (configuration_id, external_id),
+                    )
+                if not is_new and not is_reactivated:
+                    conn.execute(
+                        "UPDATE accounts SET updated_at = ? WHERE id = ?",
+                        (changed_at, account_id),
+                    )
+
+            if not config.track_all:
+                _close_active_periods(
+                    conn,
+                    account_id,
+                    changed_at,
+                    "filter_removal",
+                    keep_external_ids=target_ids,
+                )
+                if is_new:
+                    period_reason = "account_activation"
+                elif is_reactivated:
+                    period_reason = "scope_reactivation"
+                else:
+                    period_reason = "filter_addition"
+                for external_id in sorted(target_ids):
+                    manuscript_id = _get_or_create_manuscript(
+                        conn,
+                        account_id,
+                        external_id,
+                        changed_at,
+                    )
+                    _open_tracking_period(
+                        conn,
+                        manuscript_id,
+                        changed_at,
+                        period_reason,
+                    )
+
+            reconciled[config.name] = ReconciledAccount(
+                account_id=account_id,
+                configuration_id=configuration_id,
+                config=config,
+                target_ids=target_ids,
+                needs_initial_notification=needs_initial_notification,
+            )
+
+    return reconciled
 
 
 def normalize_whitespace(value: str) -> str:
