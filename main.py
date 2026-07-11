@@ -389,8 +389,8 @@ class DeliveryResult:
     scheme: str
     attempted_at: datetime
     success: bool
-    error_type: str | None
-    error_message: str | None
+    error_type: str | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
