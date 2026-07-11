@@ -8,6 +8,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -35,11 +36,13 @@ LOGGER = logging.getLogger(__name__)
 ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 MAX_ENVIRONMENT_SUBSTITUTIONS = 4096
 MAX_ENVIRONMENT_OUTPUT_CHARS = 1024 * 1024
+MAX_ENVIRONMENT_WORK_CHARS = 64 * MAX_ENVIRONMENT_OUTPUT_CHARS
 ENVIRONMENT_CYCLE_ERROR_MESSAGE = "Environment expansion contains a cycle."
 ENVIRONMENT_SUBSTITUTION_LIMIT_ERROR_MESSAGE = (
     "Environment expansion exceeds the substitution limit."
 )
 ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE = "Environment expansion exceeds the output size limit."
+ENVIRONMENT_WORK_LIMIT_ERROR_MESSAGE = "Environment expansion exceeds the work limit."
 APPRISE_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*")
 SUBMITTED_DATE = re.compile(
     r"(?P<day>[0-9]{2})-(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
@@ -1978,41 +1981,58 @@ def parse_dashboard(html: str) -> tuple[ManuscriptSnapshot, ...]:
 
 
 def expand_environment(value: str, environ: Mapping[str, str]) -> str:
-    frames: list[list[Any]] = [[value, frozenset(), None, set()]]
+    frames: list[list[Any]] = [[value, None, set(), None]]
+    active_names: set[str] = set()
     substitutions = 0
+    work_chars = 0
     while frames:
         current: str = frames[-1][0]
-        active: frozenset[str] = frames[-1][1]
-        seen_states: set[str] = frames[-1][3]
-        if len(current) > MAX_ENVIRONMENT_OUTPUT_CHARS:
+        current_length = len(current)
+        if current_length > MAX_ENVIRONMENT_OUTPUT_CHARS:
             raise ConfigError((ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE,))
-        if current in seen_states:
+        work_chars += current_length * 2
+        if work_chars > MAX_ENVIRONMENT_WORK_CHARS:
+            raise ConfigError((ENVIRONMENT_WORK_LIMIT_ERROR_MESSAGE,))
+        state = (
+            current_length,
+            sha256(current.encode("utf-8", errors="surrogatepass")).digest(),
+        )
+        seen_states: set[tuple[int, bytes]] = frames[-1][2]
+        if state in seen_states:
             raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
-        seen_states.add(current)
+        seen_states.add(state)
         match = ENVIRONMENT_REFERENCE.search(current)
         if match is not None:
             name = match.group(1)
             if name not in environ:
                 raise ConfigError((f"Environment variable {name} is not set.",))
-            if name in active:
+            if name in active_names:
                 raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
             substitutions += 1
             if substitutions > MAX_ENVIRONMENT_SUBSTITUTIONS:
                 raise ConfigError((ENVIRONMENT_SUBSTITUTION_LIMIT_ERROR_MESSAGE,))
-            frames[-1][2] = match.span()
-            frames.append([environ[name], active | {name}, None, set()])
+            frames[-1][1] = match.span()
+            active_names.add(name)
+            frames.append([environ[name], None, set(), name])
             continue
 
         resolved = current
-        frames.pop()
+        resolved_frame = frames.pop()
+        active_name: str | None = resolved_frame[3]
+        if active_name is not None:
+            active_names.remove(active_name)
         if not frames:
             return resolved
-        start, end = frames[-1][2]
+        start, end = frames[-1][1]
         parent: str = frames[-1][0]
-        if len(parent) - (end - start) + len(resolved) > MAX_ENVIRONMENT_OUTPUT_CHARS:
+        expanded_length = len(parent) - (end - start) + len(resolved)
+        if expanded_length > MAX_ENVIRONMENT_OUTPUT_CHARS:
             raise ConfigError((ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE,))
+        work_chars += expanded_length
+        if work_chars > MAX_ENVIRONMENT_WORK_CHARS:
+            raise ConfigError((ENVIRONMENT_WORK_LIMIT_ERROR_MESSAGE,))
         frames[-1][0] = parent[:start] + resolved + parent[end:]
-        frames[-1][2] = None
+        frames[-1][1] = None
     raise RuntimeError("Environment expansion ended without a result.")
 
 
