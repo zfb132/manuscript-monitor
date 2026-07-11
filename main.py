@@ -2004,9 +2004,8 @@ def expand_environment(value: str, environ: Mapping[str, str]) -> str:
         seen_states.add(state)
         match = ENVIRONMENT_REFERENCE.search(current)
         if match is not None:
-            name = match.group(1)
             if name not in environ:
-                raise ConfigError((ENVIRONMENT_UNSET_ERROR_MESSAGE,))
+                raise ConfigError((f"Environment expansion references an unset variable: {name}.",))
             if name in active_names:
                 raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
             substitutions += 1
