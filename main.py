@@ -43,6 +43,7 @@ ENVIRONMENT_SUBSTITUTION_LIMIT_ERROR_MESSAGE = (
 )
 ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE = "Environment expansion exceeds the output size limit."
 ENVIRONMENT_WORK_LIMIT_ERROR_MESSAGE = "Environment expansion exceeds the work limit."
+ENVIRONMENT_UNSET_ERROR_MESSAGE = "Environment expansion references an unset variable."
 APPRISE_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*")
 SUBMITTED_DATE = re.compile(
     r"(?P<day>[0-9]{2})-(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
@@ -2005,7 +2006,7 @@ def expand_environment(value: str, environ: Mapping[str, str]) -> str:
         if match is not None:
             name = match.group(1)
             if name not in environ:
-                raise ConfigError((f"Environment variable {name} is not set.",))
+                raise ConfigError((ENVIRONMENT_UNSET_ERROR_MESSAGE,))
             if name in active_names:
                 raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
             substitutions += 1
