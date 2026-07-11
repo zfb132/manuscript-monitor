@@ -1633,23 +1633,21 @@ def parse_dashboard(html: str) -> tuple[ManuscriptSnapshot, ...]:
 
 
 def expand_environment(value: str, environ: Mapping[str, str]) -> str:
-    current = value
-    seen: set[str] = set()
-    while True:
-        references = tuple(ENVIRONMENT_REFERENCE.finditer(current))
-        if not references:
-            return current
-        if current in seen:
-            raise ConfigError(("Environment expansion contains a cycle.",))
-        seen.add(current)
-
+    def expand(current: str, active: tuple[str, ...]) -> str:
         def replace(match: re.Match[str]) -> str:
             name = match.group(1)
             if name not in environ:
                 raise ConfigError((f"Environment variable {name} is not set.",))
-            return environ[name]
+            if name in active:
+                raise ConfigError(("Environment expansion contains a cycle.",))
+            return expand(environ[name], (*active, name))
 
-        current = ENVIRONMENT_REFERENCE.sub(replace, current)
+        expanded = ENVIRONMENT_REFERENCE.sub(replace, current)
+        if ENVIRONMENT_REFERENCE.search(expanded):
+            return expand(expanded, active)
+        return expanded
+
+    return expand(value, ())
 
 
 def _add_unknown_key_errors(
