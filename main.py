@@ -33,6 +33,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 LOGGER = logging.getLogger(__name__)
 
 ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+MAX_ENVIRONMENT_SUBSTITUTIONS = 4096
+MAX_ENVIRONMENT_OUTPUT_CHARS = 1024 * 1024
+ENVIRONMENT_CYCLE_ERROR_MESSAGE = "Environment expansion contains a cycle."
+ENVIRONMENT_SUBSTITUTION_LIMIT_ERROR_MESSAGE = (
+    "Environment expansion exceeds the substitution limit."
+)
+ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE = "Environment expansion exceeds the output size limit."
 APPRISE_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*")
 SUBMITTED_DATE = re.compile(
     r"(?P<day>[0-9]{2})-(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
@@ -446,6 +453,22 @@ PRAGMA user_version = 1;
 """
 
 SCHEMA_V2 = """
+CREATE TEMP TABLE schema_v2_destination_index_guard (
+    max_destination_index NUMERIC
+        CHECK (
+            max_destination_index IS NULL
+            OR (
+                typeof(max_destination_index) = 'integer'
+                AND max_destination_index < 9223372036854775807
+            )
+        )
+);
+
+INSERT INTO schema_v2_destination_index_guard(max_destination_index)
+SELECT MAX(destination_index) FROM notification_deliveries;
+
+DROP TABLE schema_v2_destination_index_guard;
+
 ALTER TABLE notification_batches
     ADD COLUMN destination_count INTEGER NOT NULL DEFAULT 1
         CHECK (destination_count > 0);
@@ -1955,19 +1978,29 @@ def parse_dashboard(html: str) -> tuple[ManuscriptSnapshot, ...]:
 
 
 def expand_environment(value: str, environ: Mapping[str, str]) -> str:
-    frames: list[list[Any]] = [[value, frozenset(), None]]
+    frames: list[list[Any]] = [[value, frozenset(), None, set()]]
+    substitutions = 0
     while frames:
         current: str = frames[-1][0]
         active: frozenset[str] = frames[-1][1]
+        seen_states: set[str] = frames[-1][3]
+        if len(current) > MAX_ENVIRONMENT_OUTPUT_CHARS:
+            raise ConfigError((ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE,))
+        if current in seen_states:
+            raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
+        seen_states.add(current)
         match = ENVIRONMENT_REFERENCE.search(current)
         if match is not None:
             name = match.group(1)
             if name not in environ:
                 raise ConfigError((f"Environment variable {name} is not set.",))
             if name in active:
-                raise ConfigError(("Environment expansion contains a cycle.",))
+                raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
+            substitutions += 1
+            if substitutions > MAX_ENVIRONMENT_SUBSTITUTIONS:
+                raise ConfigError((ENVIRONMENT_SUBSTITUTION_LIMIT_ERROR_MESSAGE,))
             frames[-1][2] = match.span()
-            frames.append([environ[name], active | {name}, None])
+            frames.append([environ[name], active | {name}, None, set()])
             continue
 
         resolved = current
@@ -1976,6 +2009,8 @@ def expand_environment(value: str, environ: Mapping[str, str]) -> str:
             return resolved
         start, end = frames[-1][2]
         parent: str = frames[-1][0]
+        if len(parent) - (end - start) + len(resolved) > MAX_ENVIRONMENT_OUTPUT_CHARS:
+            raise ConfigError((ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE,))
         frames[-1][0] = parent[:start] + resolved + parent[end:]
         frames[-1][2] = None
     raise RuntimeError("Environment expansion ended without a result.")
