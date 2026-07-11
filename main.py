@@ -34,6 +34,186 @@ LOGGER = logging.getLogger(__name__)
 
 ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 APPRISE_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*")
+SUBMITTED_DATE = re.compile(
+    r"(?P<day>[0-9]{2})-(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
+    r"(?P<year>[0-9]{4})"
+)
+
+INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE = "Browser dashboard capture was incomplete."
+
+DASHBOARD_CAPTURE_SCRIPT = r"""
+const selector = arguments[0];
+const timeoutMs = arguments[1];
+const done = arguments[arguments.length - 1];
+let finished = false;
+
+function finish(result) {
+    if (!finished) {
+        finished = true;
+        done(result);
+    }
+}
+
+function fail() {
+    finish({ok: false});
+}
+
+try {
+    const table = document.querySelector(selector);
+    const jq = window.jQuery;
+    if (!table || !jq || !jq.fn || !jq.fn.dataTable) {
+        fail();
+        return;
+    }
+
+    let modern = null;
+    let legacy = null;
+    try {
+        const isDataTable = jq.fn.dataTable.isDataTable;
+        if (jq.fn.DataTable && typeof isDataTable === "function" && isDataTable(table)) {
+            modern = jq(table).DataTable();
+        }
+    } catch (_) {
+        modern = null;
+    }
+    if (!modern) {
+        try {
+            const legacyCheck = jq.fn.dataTable.fnIsDataTable;
+            if (typeof legacyCheck === "function" && !legacyCheck(table)) {
+                fail();
+                return;
+            }
+            legacy = jq(table).dataTable();
+            if (!legacy || typeof legacy.fnSettings !== "function" ||
+                    typeof legacy.fnGetNodes !== "function") {
+                fail();
+                return;
+            }
+        } catch (_) {
+            fail();
+            return;
+        }
+    }
+
+    let apiTotal = null;
+    let displayTotal = null;
+    if (modern) {
+        const info = modern.page.info();
+        apiTotal = info.recordsTotal;
+        displayTotal = info.recordsDisplay;
+    } else {
+        const settings = legacy.fnSettings();
+        apiTotal = typeof legacy.fnRecordsTotal === "function"
+            ? legacy.fnRecordsTotal()
+            : settings._iRecordsTotal;
+        displayTotal = typeof legacy.fnRecordsDisplay === "function"
+            ? legacy.fnRecordsDisplay()
+            : settings._iRecordsDisplay;
+    }
+    if (!Number.isSafeInteger(apiTotal) || apiTotal < 0 ||
+            !Number.isSafeInteger(displayTotal) || displayTotal < 0 ||
+            apiTotal !== displayTotal) {
+        fail();
+        return;
+    }
+
+    const declaredTotal = Number.isSafeInteger(window.totalRecords) && window.totalRecords >= 0
+        ? window.totalRecords
+        : null;
+    const expected = declaredTotal === null ? apiTotal : declaredTotal;
+    if (expected !== apiTotal) {
+        fail();
+        return;
+    }
+
+    const expandedLength = Math.max(expected, 1);
+    if (modern) {
+        modern.page.len(expandedLength);
+        modern.page("first").draw(false);
+    } else {
+        if (typeof legacy.fnLengthChange !== "function" ||
+                typeof legacy.fnPageChange !== "function") {
+            fail();
+            return;
+        }
+        legacy.fnLengthChange(expandedLength);
+        legacy.fnPageChange("first", true);
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let priorSignature = null;
+    let stablePasses = 0;
+
+    function collectNodes() {
+        if (modern) {
+            return modern.rows().nodes().toArray();
+        }
+        return Array.prototype.slice.call(legacy.fnGetNodes());
+    }
+
+    function processingIsVisible() {
+        const processing = document.querySelector(`${selector}_processing`);
+        return Boolean(processing && window.getComputedStyle(processing).display !== "none");
+    }
+
+    function poll() {
+        try {
+            const nodes = collectNodes();
+            const ids = [];
+            for (const row of nodes) {
+                const cell = row.querySelector('td[data-label="ID"]');
+                if (!cell) {
+                    fail();
+                    return;
+                }
+                const externalId = cell.textContent.split("(", 1)[0].trim().replace(/\s+/g, " ");
+                if (!externalId) {
+                    fail();
+                    return;
+                }
+                ids.push(externalId);
+            }
+            const uniqueIds = new Set(ids);
+            const signature = ids.join("\u0000");
+            const complete = !processingIsVisible() && nodes.length === expected &&
+                uniqueIds.size === expected;
+            if (complete && signature === priorSignature) {
+                stablePasses += 1;
+            } else {
+                stablePasses = complete ? 1 : 0;
+            }
+            priorSignature = signature;
+            if (complete && stablePasses >= 2) {
+                const clone = table.cloneNode(true);
+                let body = clone.querySelector("tbody");
+                if (!body) {
+                    body = document.createElement("tbody");
+                    clone.appendChild(body);
+                }
+                body.replaceChildren(...nodes.map((row) => row.cloneNode(true)));
+                finish({
+                    ok: true,
+                    html: clone.outerHTML,
+                    row_count: nodes.length,
+                    total: expected,
+                });
+                return;
+            }
+            if (Date.now() >= deadline) {
+                fail();
+                return;
+            }
+            window.setTimeout(poll, 50);
+        } catch (_) {
+            fail();
+        }
+    }
+
+    poll();
+} catch (_) {
+    fail();
+}
+"""
 
 SUPPRESSED_OPERATION_ERROR_TYPE = "SuppressedException"
 SUPPRESSED_OPERATION_ERROR_MESSAGE = "Operation failed; error details were suppressed."
@@ -79,7 +259,7 @@ ENGLISH_MONTHS = {
     "Dec": 12,
 }
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_V1 = """
 CREATE TABLE accounts (
@@ -265,6 +445,24 @@ END;
 PRAGMA user_version = 1;
 """
 
+SCHEMA_V2 = """
+ALTER TABLE notification_batches
+    ADD COLUMN destination_count INTEGER NOT NULL DEFAULT 1
+        CHECK (destination_count > 0);
+
+UPDATE notification_batches
+SET destination_count = COALESCE(
+    (
+        SELECT MAX(notification_deliveries.destination_index) + 1
+        FROM notification_deliveries
+        WHERE notification_deliveries.batch_id = notification_batches.id
+    ),
+    1
+);
+
+PRAGMA user_version = 2;
+"""
+
 _MISSING = object()
 
 
@@ -406,6 +604,7 @@ class StoredNotificationBatch:
     body: str
     event_count: int
     reason: str
+    destination_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +821,13 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     if version == 0:
         try:
             conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V1 + "\nCOMMIT;")
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        version = 1
+    if version == 1:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V2 + "\nCOMMIT;")
         except sqlite3.Error:
             conn.rollback()
             raise
@@ -908,31 +1114,61 @@ def prepare_check(
         conn.execute("BEGIN IMMEDIATE")
         check_row = conn.execute(
             "SELECT checks.configuration_id, checks.outcome, checks.parsed_count, "
-            "account_configurations.account_id, account_configurations.track_all, "
-            "account_configurations.active_until, "
+            "account_configurations.account_id, account_configurations.url, "
+            "account_configurations.username, account_configurations.track_all, "
+            "account_configurations.active_until, accounts.name AS account_name, "
+            "accounts.active AS account_active, accounts.needs_initial_notification, "
             "EXISTS(SELECT 1 FROM observations WHERE observations.check_id = checks.id) "
             "AS has_observations, "
             "EXISTS(SELECT 1 FROM notification_batches "
-            "WHERE notification_batches.check_id = checks.id) AS has_batch "
+            "WHERE notification_batches.check_id = checks.id) AS has_batch, "
+            "EXISTS(SELECT 1 FROM checks AS newer_checks "
+            "WHERE newer_checks.configuration_id = checks.configuration_id "
+            "AND newer_checks.id > checks.id) AS has_newer_check "
             "FROM checks JOIN account_configurations "
-            "ON account_configurations.id = checks.configuration_id WHERE checks.id = ?",
+            "ON account_configurations.id = checks.configuration_id "
+            "JOIN accounts ON accounts.id = account_configurations.account_id "
+            "WHERE checks.id = ?",
             (check_id,),
         ).fetchone()
+        stored_targets = frozenset(
+            str(row["external_id"])
+            for row in conn.execute(
+                "SELECT external_id FROM account_configuration_targets WHERE configuration_id = ?",
+                (account.configuration_id,),
+            ).fetchall()
+        )
+        configured_targets = frozenset(account.config.manuscript_ids)
         if (
             check_row is None
+            or type(account.account_id) is not int
+            or type(account.configuration_id) is not int
+            or type(account.needs_initial_notification) is not bool
+            or type(account.target_ids) is not frozenset
             or check_row["outcome"] != "running"
             or int(check_row["configuration_id"]) != account.configuration_id
             or int(check_row["account_id"]) != account.account_id
+            or str(check_row["account_name"]) != account.config.name
+            or not bool(check_row["account_active"])
+            or bool(check_row["needs_initial_notification"]) != account.needs_initial_notification
+            or str(check_row["url"]) != account.config.url
+            or str(check_row["username"]) != account.config.username
             or bool(check_row["track_all"]) != account.config.track_all
             or check_row["active_until"] is not None
+            or configured_targets != account.target_ids
+            or stored_targets != account.target_ids
         ):
-            raise DatabaseError("The running check does not belong to the reconciled account.")
+            raise DatabaseError(
+                "The reconciled account does not match the durable account configuration."
+            )
         if (
             check_row["parsed_count"] is not None
             or bool(check_row["has_observations"])
             or bool(check_row["has_batch"])
         ):
             raise DatabaseError("The running check has already been prepared.")
+        if bool(check_row["has_newer_check"]):
+            raise DatabaseError("A newer check already exists for this account configuration.")
         claim_cursor = conn.execute(
             "UPDATE checks SET parsed_count = ? "
             "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
@@ -1067,9 +1303,12 @@ def prepare_check(
         )
         batch: StoredNotificationBatch | None = None
         if message is not None:
+            destination_count = len(account.config.apprise_urls)
+            if destination_count < 1:
+                raise DatabaseError("A notification batch requires at least one destination.")
             cursor = conn.execute(
                 "INSERT INTO notification_batches(check_id, account_id, reason, title, body, "
-                "event_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "event_count, created_at, destination_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     check_id,
                     account.account_id,
@@ -1078,6 +1317,7 @@ def prepare_check(
                     message.body,
                     message.event_count,
                     observed_text,
+                    destination_count,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1088,6 +1328,7 @@ def prepare_check(
                 body=message.body,
                 event_count=message.event_count,
                 reason=message.reason,
+                destination_count=destination_count,
             )
 
     return PreparedCheck(
@@ -1134,22 +1375,29 @@ def record_delivery(
 ) -> None:
     attempted_at = _validated_delivery_timestamp(result)
     with conn:
-        cursor = conn.execute(
-            "INSERT INTO notification_deliveries("
-            "batch_id, destination_index, scheme, attempted_at, success, error_type, error_message"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                batch_id,
-                result.destination_index,
-                result.scheme,
-                attempted_at,
-                int(result.success),
-                result.error_type,
-                result.error_message,
-            ),
-        )
+        try:
+            cursor = conn.execute(
+                "INSERT INTO notification_deliveries("
+                "batch_id, destination_index, scheme, attempted_at, success, error_type, "
+                "error_message) SELECT notification_batches.id, ?, ?, ?, ?, ?, ? "
+                "FROM notification_batches WHERE notification_batches.id = ? "
+                "AND notification_batches.committed_at IS NULL "
+                "AND ? < notification_batches.destination_count",
+                (
+                    result.destination_index,
+                    result.scheme,
+                    attempted_at,
+                    int(result.success),
+                    result.error_type,
+                    result.error_message,
+                    batch_id,
+                    result.destination_index,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise DatabaseError("The delivery attempt could not be recorded.") from None
         if cursor.rowcount != 1:
-            raise DatabaseError("The delivery attempt could not be recorded.")
+            raise DatabaseError("The delivery attempt does not match a planned destination.")
 
 
 def _prepared_event_projections(
@@ -1242,7 +1490,8 @@ def _validate_prepared_batch(
         "notification_batches.account_id AS batch_account_id, "
         "notification_batches.reason, notification_batches.title, "
         "notification_batches.body, notification_batches.event_count, "
-        "notification_batches.committed_at, checks.configuration_id, "
+        "notification_batches.destination_count, notification_batches.committed_at, "
+        "checks.configuration_id, "
         "checks.outcome, checks.parsed_count, "
         "account_configurations.account_id AS configuration_account_id, "
         "account_configurations.active_until, accounts.active AS account_active, "
@@ -1271,6 +1520,7 @@ def _validate_prepared_batch(
         or row["title"] != batch.title
         or row["body"] != batch.body
         or int(row["event_count"]) != batch.event_count
+        or int(row["destination_count"]) != batch.destination_count
     ):
         raise DatabaseError("The prepared notification batch is stale or mismatched.")
 
@@ -1288,6 +1538,24 @@ def _validate_prepared_batch(
         raise DatabaseError("Prepared events do not match the durable pending projections.")
 
 
+def _validated_delivery_plan(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    destination_count: int,
+) -> bool:
+    if type(destination_count) is not int or destination_count < 1:
+        raise DatabaseError("The delivery attempt plan is incomplete or invalid.")
+    rows = conn.execute(
+        "SELECT destination_index, success FROM notification_deliveries "
+        "WHERE batch_id = ? ORDER BY destination_index",
+        (batch_id,),
+    ).fetchall()
+    indices = tuple(int(row["destination_index"]) for row in rows)
+    if indices != tuple(range(destination_count)):
+        raise DatabaseError("The delivery attempt plan is incomplete or invalid.")
+    return any(bool(row["success"]) for row in rows)
+
+
 def commit_prepared_check(
     conn: sqlite3.Connection,
     prepared: PreparedCheck,
@@ -1298,15 +1566,16 @@ def commit_prepared_check(
     timestamp = utc_text(committed_at)
     with conn:
         conn.execute("BEGIN IMMEDIATE")
-        succeeded = conn.execute(
-            "SELECT 1 FROM notification_deliveries WHERE batch_id = ? AND success = 1 LIMIT 1",
-            (prepared.batch.id,),
-        ).fetchone()
-        if succeeded is None:
+        _validate_prepared_batch(conn, prepared)
+        succeeded = _validated_delivery_plan(
+            conn,
+            prepared.batch.id,
+            prepared.batch.destination_count,
+        )
+        if not succeeded:
             raise DatabaseError(
                 "An uncommitted matching batch with a successful delivery is required."
             )
-        _validate_prepared_batch(conn, prepared)
         batch_cursor = conn.execute(
             "UPDATE notification_batches SET committed_at = ? "
             "WHERE id = ? AND check_id = ? AND account_id = ? AND committed_at IS NULL",
@@ -1367,13 +1636,14 @@ def fail_prepared_check(
     timestamp = utc_text(completed_at)
     with conn:
         conn.execute("BEGIN IMMEDIATE")
-        succeeded = conn.execute(
-            "SELECT 1 FROM notification_deliveries WHERE batch_id = ? AND success = 1 LIMIT 1",
-            (prepared.batch.id,),
-        ).fetchone()
-        if succeeded is not None:
-            raise DatabaseError("Only an uncommitted batch without a success may fail.")
         _validate_prepared_batch(conn, prepared)
+        succeeded = _validated_delivery_plan(
+            conn,
+            prepared.batch.id,
+            prepared.batch.destination_count,
+        )
+        if succeeded:
+            raise DatabaseError("Only an uncommitted batch without a success may fail.")
         cursor = conn.execute(
             "UPDATE checks SET completed_at = ?, outcome = 'failed', "
             "error_type = ?, error_message = ? "
@@ -1474,6 +1744,45 @@ def create_chrome_driver(
     return driver
 
 
+def _validated_complete_dashboard_html(payload: object) -> str:
+    if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+    html = payload.get("html")
+    row_count = payload.get("row_count")
+    total = payload.get("total")
+    if (
+        type(html) is not str
+        or type(row_count) is not int
+        or type(total) is not int
+        or row_count < 0
+        or total < 0
+        or row_count != total
+    ):
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+
+    document = BeautifulSoup(html, "html.parser")
+    table = document.find("table", id="authorDashboardQueue")
+    if not isinstance(table, Tag):
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+    try:
+        rows = _dashboard_rows(table)
+        external_ids = [
+            normalize_manuscript_id(
+                _dashboard_cell(row, "ID", row_number).get_text(" ", strip=True)
+            )
+            for row_number, row in enumerate(rows, start=1)
+        ]
+    except DashboardParseError:
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE) from None
+    if (
+        len(rows) != total
+        or any(not external_id for external_id in external_ids)
+        or len(set(external_ids)) != total
+    ):
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+    return html
+
+
 def capture_dashboard_html(
     account: AccountConfig,
     browser: BrowserConfig,
@@ -1509,7 +1818,16 @@ def capture_dashboard_html(
         else:
             author.click()
         wait.until(EC.presence_of_element_located((By.ID, "authorDashboardQueue")))
-        return driver.page_source
+        if hasattr(driver, "set_script_timeout"):
+            driver.set_script_timeout(browser.element_timeout_seconds + 1)
+        payload = driver.execute_async_script(
+            DASHBOARD_CAPTURE_SCRIPT,
+            "#authorDashboardQueue",
+            max((browser.element_timeout_seconds - 1) * 1000, 1000),
+        )
+        return _validated_complete_dashboard_html(payload)
+    except BrowserCaptureError:
+        raise
     except Exception as exc:
         raise BrowserCaptureError(f"Browser capture failed with {type(exc).__name__}.") from exc
     finally:
@@ -1529,11 +1847,15 @@ def normalize_manuscript_id(value: str) -> str:
 
 
 def parse_submitted_date(value: str) -> date:
-    parts = normalize_whitespace(value).split("-")
-    if len(parts) != 3 or parts[1] not in ENGLISH_MONTHS:
+    match = SUBMITTED_DATE.fullmatch(normalize_whitespace(value))
+    if match is None:
         raise DashboardParseError("Submission date must use DD-Mon-YYYY.")
     try:
-        return date(int(parts[2]), ENGLISH_MONTHS[parts[1]], int(parts[0]))
+        return date(
+            int(match.group("year")),
+            ENGLISH_MONTHS[match.group("month")],
+            int(match.group("day")),
+        )
     except ValueError as exc:
         raise DashboardParseError("Submission date is invalid.") from exc
 
@@ -1633,21 +1955,30 @@ def parse_dashboard(html: str) -> tuple[ManuscriptSnapshot, ...]:
 
 
 def expand_environment(value: str, environ: Mapping[str, str]) -> str:
-    def expand(current: str, active: tuple[str, ...]) -> str:
-        def replace(match: re.Match[str]) -> str:
+    frames: list[list[Any]] = [[value, frozenset(), None]]
+    while frames:
+        current: str = frames[-1][0]
+        active: frozenset[str] = frames[-1][1]
+        match = ENVIRONMENT_REFERENCE.search(current)
+        if match is not None:
             name = match.group(1)
             if name not in environ:
                 raise ConfigError((f"Environment variable {name} is not set.",))
             if name in active:
                 raise ConfigError(("Environment expansion contains a cycle.",))
-            return expand(environ[name], (*active, name))
+            frames[-1][2] = match.span()
+            frames.append([environ[name], active | {name}, None])
+            continue
 
-        expanded = ENVIRONMENT_REFERENCE.sub(replace, current)
-        if ENVIRONMENT_REFERENCE.search(expanded):
-            return expand(expanded, active)
-        return expanded
-
-    return expand(value, ())
+        resolved = current
+        frames.pop()
+        if not frames:
+            return resolved
+        start, end = frames[-1][2]
+        parent: str = frames[-1][0]
+        frames[-1][0] = parent[:start] + resolved + parent[end:]
+        frames[-1][2] = None
+    raise RuntimeError("Environment expansion ended without a result.")
 
 
 def _add_unknown_key_errors(
@@ -1657,9 +1988,10 @@ def _add_unknown_key_errors(
     path: str,
     errors: list[str],
 ) -> None:
-    for key in value:
-        if key not in allowed:
-            errors.append(f"{path}.{key}: unknown key.")
+    count = sum(key not in allowed for key in value)
+    if count:
+        noun = "key" if count == 1 else "keys"
+        errors.append(f"{path}: contains {count} unknown {noun}.")
 
 
 def _read_mapping(
