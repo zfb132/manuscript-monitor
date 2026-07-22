@@ -1,116 +1,2557 @@
+import argparse
+import logging
 import os
-import random
-import smtplib
-import time
-from bs4 import BeautifulSoup
+import re
+import sqlite3
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from enum import Enum
+from hashlib import sha256
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
+import apprise
+from bs4 import BeautifulSoup, Tag
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 from selenium import webdriver
-from splinter import Browser
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
-from email.mime.text import MIMEText
-from email.header import Header
-from log import initLog
-from config import *
-
-logging = initLog('submission.log', __name__)
-
-def send_email(msg):
-    message = MIMEText(f'New status for {URL} \n\n{msg}', 'plain', 'utf-8')
-    message['From'] = f"NewStatus <{SENDER_EMAIL}>"
-    message['To'] =  ", ".join(RECEIVERS)
-    subject = URL.split('/')[-1].upper()
-    message['Subject'] = f'{subject} Manuscript Status: {msg}'
-    try:
-        smtpObj = smtplib.SMTP() 
-        smtpObj.connect(SENDER_SERVER, SMTP_PORT)
-        smtpObj.login(SENDER_EMAIL, SENDER_PWD)  
-        smtpObj.sendmail(SENDER_EMAIL, RECEIVERS, message.as_string())
-        print("Sent email successfully")
-        logging.info("Sent email successfully")
-    except smtplib.SMTPException as e:
-        print("Error: unable to send email")
-        print(repr(e))
-        logging.error("Error: unable to send email")
+# ruff: noqa: F401
 
 
-def get_random_interval():
-    '''
-    获取随机时间间隔
-    '''
-    return random.randint(1, 5)
+LOGGER = logging.getLogger(__name__)
+
+ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+MAX_ENVIRONMENT_SUBSTITUTIONS = 4096
+MAX_ENVIRONMENT_OUTPUT_CHARS = 1024 * 1024
+MAX_ENVIRONMENT_WORK_CHARS = 64 * MAX_ENVIRONMENT_OUTPUT_CHARS
+ENVIRONMENT_CYCLE_ERROR_MESSAGE = "Environment expansion contains a cycle."
+ENVIRONMENT_SUBSTITUTION_LIMIT_ERROR_MESSAGE = (
+    "Environment expansion exceeds the substitution limit."
+)
+ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE = "Environment expansion exceeds the output size limit."
+ENVIRONMENT_WORK_LIMIT_ERROR_MESSAGE = "Environment expansion exceeds the work limit."
+ENVIRONMENT_UNSET_ERROR_MESSAGE = "Environment expansion references an unset variable."
+APPRISE_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*")
+SUBMITTED_DATE = re.compile(
+    r"(?P<day>[0-9]{2})-(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-"
+    r"(?P<year>[0-9]{4})"
+)
+
+INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE = "Browser dashboard capture was incomplete."
+
+DASHBOARD_CAPTURE_SCRIPT = r"""
+const selector = arguments[0];
+const timeoutMs = arguments[1];
+const done = arguments[arguments.length - 1];
+let finished = false;
+
+function finish(result) {
+    if (!finished) {
+        finished = true;
+        done(result);
+    }
+}
+
+function fail() {
+    finish({ok: false});
+}
+
+try {
+    const table = document.querySelector(selector);
+    const jq = window.jQuery;
+    if (!table || !jq || !jq.fn || !jq.fn.dataTable) {
+        fail();
+        return;
+    }
+
+    let modern = null;
+    let legacy = null;
+    try {
+        const isDataTable = jq.fn.dataTable.isDataTable;
+        if (jq.fn.DataTable && typeof isDataTable === "function" && isDataTable(table)) {
+            modern = jq(table).DataTable();
+        }
+    } catch (_) {
+        modern = null;
+    }
+    if (!modern) {
+        try {
+            const legacyCheck = jq.fn.dataTable.fnIsDataTable;
+            if (typeof legacyCheck === "function" && !legacyCheck(table)) {
+                fail();
+                return;
+            }
+            legacy = jq(table).dataTable();
+            if (!legacy || typeof legacy.fnSettings !== "function" ||
+                    typeof legacy.fnGetNodes !== "function") {
+                fail();
+                return;
+            }
+        } catch (_) {
+            fail();
+            return;
+        }
+    }
+
+    let apiTotal = null;
+    let displayTotal = null;
+    if (modern) {
+        const info = modern.page.info();
+        apiTotal = info.recordsTotal;
+        displayTotal = info.recordsDisplay;
+    } else {
+        const settings = legacy.fnSettings();
+        apiTotal = typeof legacy.fnRecordsTotal === "function"
+            ? legacy.fnRecordsTotal()
+            : settings._iRecordsTotal;
+        displayTotal = typeof legacy.fnRecordsDisplay === "function"
+            ? legacy.fnRecordsDisplay()
+            : settings._iRecordsDisplay;
+    }
+    if (!Number.isSafeInteger(apiTotal) || apiTotal < 0 ||
+            !Number.isSafeInteger(displayTotal) || displayTotal < 0 ||
+            apiTotal !== displayTotal) {
+        fail();
+        return;
+    }
+
+    const declaredTotal = Number.isSafeInteger(window.totalRecords) && window.totalRecords >= 0
+        ? window.totalRecords
+        : null;
+    const expected = declaredTotal === null ? apiTotal : declaredTotal;
+    if (expected !== apiTotal) {
+        fail();
+        return;
+    }
+
+    const expandedLength = Math.max(expected, 1);
+    if (modern) {
+        modern.page.len(expandedLength);
+        modern.page("first").draw(false);
+    } else {
+        if (typeof legacy.fnLengthChange !== "function" ||
+                typeof legacy.fnPageChange !== "function") {
+            fail();
+            return;
+        }
+        legacy.fnLengthChange(expandedLength);
+        legacy.fnPageChange("first", true);
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let priorSignature = null;
+    let stablePasses = 0;
+
+    function collectNodes() {
+        if (modern) {
+            return modern.rows().nodes().toArray();
+        }
+        return Array.prototype.slice.call(legacy.fnGetNodes());
+    }
+
+    function processingIsVisible() {
+        const processing = document.querySelector(`${selector}_processing`);
+        return Boolean(processing && window.getComputedStyle(processing).display !== "none");
+    }
+
+    function poll() {
+        try {
+            const nodes = collectNodes();
+            const ids = [];
+            for (const row of nodes) {
+                const cell = row.querySelector('td[data-label="ID"]');
+                if (!cell) {
+                    fail();
+                    return;
+                }
+                const externalId = cell.textContent.split("(", 1)[0].trim().replace(/\s+/g, " ");
+                if (!externalId) {
+                    fail();
+                    return;
+                }
+                ids.push(externalId);
+            }
+            const uniqueIds = new Set(ids);
+            const signature = ids.join("\u0000");
+            const complete = !processingIsVisible() && nodes.length === expected &&
+                uniqueIds.size === expected;
+            if (complete && signature === priorSignature) {
+                stablePasses += 1;
+            } else {
+                stablePasses = complete ? 1 : 0;
+            }
+            priorSignature = signature;
+            if (complete && stablePasses >= 2) {
+                const clone = table.cloneNode(true);
+                let body = clone.querySelector("tbody");
+                if (!body) {
+                    body = document.createElement("tbody");
+                    clone.appendChild(body);
+                }
+                body.replaceChildren(...nodes.map((row) => row.cloneNode(true)));
+                finish({
+                    ok: true,
+                    html: clone.outerHTML,
+                    row_count: nodes.length,
+                    total: expected,
+                });
+                return;
+            }
+            if (Date.now() >= deadline) {
+                fail();
+                return;
+            }
+            window.setTimeout(poll, 50);
+        } catch (_) {
+            fail();
+        }
+    }
+
+    poll();
+} catch (_) {
+    fail();
+}
+"""
+
+SUPPRESSED_OPERATION_ERROR_TYPE = "SuppressedException"
+SUPPRESSED_OPERATION_ERROR_MESSAGE = "Operation failed; error details were suppressed."
+INVALID_DESTINATION_ERROR_TYPE = "InvalidDestination"
+INVALID_DESTINATION_ERROR_MESSAGE = "Apprise rejected this destination."
+DELIVERY_FAILED_ERROR_TYPE = "DeliveryFailed"
+DELIVERY_FAILED_ERROR_MESSAGE = "Apprise reported a failed delivery."
+APPRISE_EXCEPTION_ERROR_TYPE = "AppriseException"
+APPRISE_EXCEPTION_ERROR_MESSAGE = "Apprise delivery raised an exception."
+ALLOWED_DELIVERY_FAILURES = frozenset(
+    {
+        (INVALID_DESTINATION_ERROR_TYPE, INVALID_DESTINATION_ERROR_MESSAGE),
+        (DELIVERY_FAILED_ERROR_TYPE, DELIVERY_FAILED_ERROR_MESSAGE),
+        (APPRISE_EXCEPTION_ERROR_TYPE, APPRISE_EXCEPTION_ERROR_MESSAGE),
+    }
+)
+
+ROOT_KEYS = frozenset({"storage", "browser", "accounts"})
+STORAGE_KEYS = frozenset({"database_path"})
+BROWSER_KEYS = frozenset(
+    {
+        "headless",
+        "element_timeout_seconds",
+        "page_load_timeout_seconds",
+        "binary_path",
+        "driver_path",
+    }
+)
+ACCOUNT_KEYS = frozenset({"name", "url", "username", "password", "manuscript_ids", "apprise_urls"})
+
+ENGLISH_MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+
+SCHEMA_VERSION = 2
+
+SCHEMA_V1 = """
+CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE CHECK (length(trim(name)) > 0),
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+    needs_initial_notification INTEGER NOT NULL
+        CHECK (needs_initial_notification IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE account_configurations (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    url TEXT NOT NULL CHECK (length(trim(url)) > 0),
+    username TEXT NOT NULL CHECK (length(trim(username)) > 0),
+    track_all INTEGER NOT NULL CHECK (track_all IN (0, 1)),
+    active_from TEXT NOT NULL,
+    active_until TEXT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX account_configurations_one_active
+    ON account_configurations(account_id) WHERE active_until IS NULL;
+
+CREATE TABLE account_configuration_targets (
+    configuration_id INTEGER NOT NULL,
+    external_id TEXT NOT NULL CHECK (length(trim(external_id)) > 0),
+    PRIMARY KEY (configuration_id, external_id),
+    FOREIGN KEY (configuration_id)
+        REFERENCES account_configurations(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE checks (
+    id INTEGER PRIMARY KEY,
+    configuration_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('running', 'succeeded', 'failed')),
+    parsed_count INTEGER CHECK (parsed_count IS NULL OR parsed_count >= 0),
+    error_type TEXT,
+    error_message TEXT,
+    CHECK (
+        (outcome = 'running' AND completed_at IS NULL)
+        OR (outcome <> 'running' AND completed_at IS NOT NULL)
+    ),
+    FOREIGN KEY (configuration_id)
+        REFERENCES account_configurations(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE manuscripts (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    external_id TEXT NOT NULL CHECK (length(trim(external_id)) > 0),
+    created_at TEXT NOT NULL,
+    first_seen_at TEXT,
+    UNIQUE (account_id, external_id),
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE tracking_periods (
+    id INTEGER PRIMARY KEY,
+    manuscript_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    started_reason TEXT NOT NULL CHECK (
+        started_reason IN (
+            'account_activation',
+            'filter_addition',
+            'track_all_discovery',
+            'scope_reactivation'
+        )
+    ),
+    ended_reason TEXT CHECK (
+        ended_reason IS NULL
+        OR ended_reason IN ('account_removal', 'filter_removal')
+    ),
+    CHECK (
+        (ended_at IS NULL AND ended_reason IS NULL)
+        OR (ended_at IS NOT NULL AND ended_reason IS NOT NULL)
+    ),
+    UNIQUE (id, manuscript_id),
+    FOREIGN KEY (manuscript_id) REFERENCES manuscripts(id) ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX tracking_periods_one_active
+    ON tracking_periods(manuscript_id) WHERE ended_at IS NULL;
+
+CREATE TABLE observations (
+    id INTEGER PRIMARY KEY,
+    check_id INTEGER NOT NULL,
+    manuscript_id INTEGER NOT NULL,
+    tracking_period_id INTEGER NOT NULL,
+    present INTEGER NOT NULL CHECK (present IN (0, 1)),
+    title TEXT,
+    submitted_text TEXT,
+    submitted_date TEXT,
+    status TEXT,
+    observed_at TEXT NOT NULL,
+    CHECK (
+        (present = 1 AND title IS NOT NULL AND submitted_text IS NOT NULL
+            AND submitted_date IS NOT NULL AND status IS NOT NULL)
+        OR (present = 0 AND title IS NULL AND submitted_text IS NULL
+            AND submitted_date IS NULL AND status IS NULL)
+    ),
+    UNIQUE (check_id, tracking_period_id),
+    UNIQUE (id, tracking_period_id),
+    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE RESTRICT,
+    FOREIGN KEY (manuscript_id) REFERENCES manuscripts(id) ON DELETE RESTRICT,
+    FOREIGN KEY (tracking_period_id, manuscript_id)
+        REFERENCES tracking_periods(id, manuscript_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE current_states (
+    tracking_period_id INTEGER PRIMARY KEY,
+    observation_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (tracking_period_id)
+        REFERENCES tracking_periods(id) ON DELETE RESTRICT,
+    FOREIGN KEY (observation_id, tracking_period_id)
+        REFERENCES observations(id, tracking_period_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE notification_batches (
+    id INTEGER PRIMARY KEY,
+    check_id INTEGER NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('initial_verification', 'manuscript_changes')),
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    event_count INTEGER NOT NULL CHECK (event_count >= 0),
+    created_at TEXT NOT NULL,
+    committed_at TEXT,
+    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE RESTRICT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE notification_deliveries (
+    id INTEGER PRIMARY KEY,
+    batch_id INTEGER NOT NULL,
+    destination_index INTEGER NOT NULL CHECK (destination_index >= 0),
+    scheme TEXT NOT NULL CHECK (length(trim(scheme)) > 0),
+    attempted_at TEXT NOT NULL,
+    success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    error_type TEXT,
+    error_message TEXT,
+    UNIQUE (batch_id, destination_index),
+    FOREIGN KEY (batch_id)
+        REFERENCES notification_batches(id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER observations_account_matches_check
+BEFORE INSERT ON observations
+FOR EACH ROW
+WHEN (
+    SELECT account_configurations.account_id
+    FROM checks
+    JOIN account_configurations
+        ON account_configurations.id = checks.configuration_id
+    WHERE checks.id = NEW.check_id
+) <> (
+    SELECT manuscripts.account_id
+    FROM manuscripts
+    WHERE manuscripts.id = NEW.manuscript_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'observation account does not match check');
+END;
+
+CREATE TRIGGER notification_batch_account_matches_check
+BEFORE INSERT ON notification_batches
+FOR EACH ROW
+WHEN NEW.account_id <> (
+    SELECT account_configurations.account_id
+    FROM checks
+    JOIN account_configurations
+        ON account_configurations.id = checks.configuration_id
+    WHERE checks.id = NEW.check_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'notification batch account does not match check');
+END;
+
+PRAGMA user_version = 1;
+"""
+
+SCHEMA_V2 = """
+CREATE TEMP TABLE schema_v2_destination_index_guard (
+    max_destination_index NUMERIC
+        CHECK (
+            max_destination_index IS NULL
+            OR (
+                typeof(max_destination_index) = 'integer'
+                AND max_destination_index < 9223372036854775807
+            )
+        )
+);
+
+INSERT INTO schema_v2_destination_index_guard(max_destination_index)
+SELECT MAX(destination_index) FROM notification_deliveries;
+
+DROP TABLE schema_v2_destination_index_guard;
+
+ALTER TABLE notification_batches
+    ADD COLUMN destination_count INTEGER NOT NULL DEFAULT 1
+        CHECK (destination_count > 0);
+
+UPDATE notification_batches
+SET destination_count = COALESCE(
+    (
+        SELECT MAX(notification_deliveries.destination_index) + 1
+        FROM notification_deliveries
+        WHERE notification_deliveries.batch_id = notification_batches.id
+    ),
+    1
+);
+
+PRAGMA user_version = 2;
+"""
+
+_MISSING = object()
 
 
-def update_status(status):
-    '''
-    更新投稿状态
-    '''
-    name = "status.txt"
-    if not os.path.exists(name):
-        with open(name, 'w') as f:
-            f.write(status)
-            logging.info(f'Crate {name} file: current status is "{status}"')
+class ConfigError(ValueError):
+    def __init__(self, errors: Sequence[str]) -> None:
+        self.errors = tuple(errors)
+        super().__init__("Configuration is invalid:\n- " + "\n- ".join(self.errors))
+
+
+class DashboardParseError(ValueError):
+    pass
+
+
+class BrowserCaptureError(RuntimeError):
+    pass
+
+
+class DatabaseError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class StorageConfig:
+    database_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserConfig:
+    headless: bool
+    element_timeout_seconds: int
+    page_load_timeout_seconds: int
+    binary_path: Path | None
+    driver_path: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class AccountConfig:
+    name: str
+    url: str
+    username: str
+    password: str = field(repr=False)
+    manuscript_ids: tuple[str, ...]
+    apprise_urls: tuple[str, ...] = field(repr=False)
+
+    @property
+    def track_all(self) -> bool:
+        return not self.manuscript_ids
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciledAccount:
+    account_id: int
+    configuration_id: int
+    config: AccountConfig
+    target_ids: frozenset[str]
+    needs_initial_notification: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AppConfig:
+    storage: StorageConfig
+    browser: BrowserConfig
+    accounts: tuple[AccountConfig, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ManuscriptSnapshot:
+    external_id: str
+    title: str
+    submitted_text: str
+    submitted_date: date
+    status: str
+
+
+class EventType(str, Enum):
+    CURRENT = "CURRENT"
+    NEW = "NEW"
+    STATUS_CHANGED = "STATUS_CHANGED"
+    DISAPPEARED = "DISAPPEARED"
+    REAPPEARED = "REAPPEARED"
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedState:
+    tracking_period_id: int
+    observation_id: int
+    present: bool
+    snapshot: ManuscriptSnapshot | None
+
+
+@dataclass(frozen=True, slots=True)
+class ManuscriptEvent:
+    kind: EventType
+    current: ManuscriptSnapshot | None
+    previous: ManuscriptSnapshot | None
+
+    @property
+    def external_id(self) -> str:
+        snapshot = self.current or self.previous
+        if snapshot is None:
+            raise RuntimeError("A manuscript event requires a snapshot.")
+        return snapshot.external_id
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationMessage:
+    reason: str
+    title: str
+    body: str
+    event_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class RedactedError:
+    error_type: str
+    error_message: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryResult:
+    destination_index: int
+    scheme: str
+    attempted_at: datetime
+    success: bool
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionUpdate:
+    tracking_period_id: int
+    observation_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoredNotificationBatch:
+    id: int
+    title: str
+    body: str
+    event_count: int
+    reason: str
+    destination_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCheck:
+    check_id: int
+    account_id: int
+    configuration_id: int
+    parsed_count: int
+    events: tuple[ManuscriptEvent, ...]
+    batch: StoredNotificationBatch | None
+    deferred_updates: tuple[ProjectionUpdate, ...]
+    clear_initial_on_commit: bool
+
+
+def calculate_events(
+    current: Mapping[str, ManuscriptSnapshot],
+    accepted: Mapping[str, AcceptedState],
+    *,
+    initial_verification: bool,
+) -> tuple[ManuscriptEvent, ...]:
+    events: list[ManuscriptEvent] = []
+    for external_id in sorted(set(current) | set(accepted)):
+        current_snapshot = current.get(external_id)
+        previous = accepted.get(external_id)
+        if initial_verification and current_snapshot is not None:
+            kind = EventType.CURRENT
+        elif previous is None and current_snapshot is not None:
+            kind = EventType.NEW
+        elif previous is not None and previous.present and current_snapshot is None:
+            kind = EventType.DISAPPEARED
+        elif previous is not None and not previous.present and current_snapshot is not None:
+            kind = EventType.REAPPEARED
+        elif (
+            previous is not None
+            and previous.present
+            and previous.snapshot is not None
+            and current_snapshot is not None
+            and previous.snapshot.status != current_snapshot.status
+        ):
+            kind = EventType.STATUS_CHANGED
+        else:
+            continue
+        events.append(
+            ManuscriptEvent(
+                kind=kind,
+                current=current_snapshot,
+                previous=None if previous is None else previous.snapshot,
+            )
+        )
+    return tuple(events)
+
+
+def _notification_event_lines(event: ManuscriptEvent) -> list[str]:
+    snapshot = event.current or event.previous
+    if snapshot is None:
+        raise RuntimeError("A manuscript event requires a snapshot.")
+    lines = [
+        f"Event: {event.kind.value}",
+        f"ID: {event.external_id}",
+        f"Title: {snapshot.title}",
+        f"Submitted: {snapshot.submitted_text}",
+    ]
+    if event.kind is EventType.STATUS_CHANGED:
+        if event.previous is None or event.current is None:
+            raise RuntimeError("A status change requires previous and current snapshots.")
+        lines.extend(
+            (
+                f"Previous status: {event.previous.status}",
+                f"Current status: {event.current.status}",
+            )
+        )
+    elif event.kind is EventType.DISAPPEARED:
+        lines.append(f"Last known status: {snapshot.status}")
     else:
-        with open(name, 'r') as f:
-            previous_status = f.read()
-            if previous_status != status:
-                with open(name, 'w') as f:
-                    f.write(status)
-                    logging.info(f'Update {name} file: current status is "{status}"')
-                    send_email(status)
+        lines.append(f"Status: {snapshot.status}")
+    return lines
+
+
+def build_notification(
+    account_name: str,
+    checked_at: datetime,
+    events: Sequence[ManuscriptEvent],
+    *,
+    initial_verification: bool,
+) -> NotificationMessage | None:
+    if not events and not initial_verification:
+        return None
+
+    reason = "initial_verification" if initial_verification else "manuscript_changes"
+    title = (
+        f"Submission status verification for {account_name}"
+        if initial_verification
+        else f"Submission status changes for {account_name}"
+    )
+    sections = [f"Account: {account_name}\nChecked at: {utc_text(checked_at)}"]
+    if events:
+        sections.extend(
+            "\n".join(_notification_event_lines(event))
+            for event in sorted(events, key=lambda event: event.external_id)
+        )
+    else:
+        sections.append("No manuscripts were found in the current scope.")
+    return NotificationMessage(
+        reason=reason,
+        title=title,
+        body="\n\n".join(sections),
+        event_count=len(events),
+    )
+
+
+def extract_apprise_scheme(url: str) -> str:
+    try:
+        candidate = urlsplit(url).scheme.lower()
+    except ValueError:
+        return "unknown"
+    return candidate if APPRISE_SCHEME.fullmatch(candidate) else "unknown"
+
+
+def redact_exception(
+    exc: BaseException,
+    secrets: Iterable[str] = (),
+) -> RedactedError:
+    del exc, secrets
+    return RedactedError(
+        SUPPRESSED_OPERATION_ERROR_TYPE,
+        SUPPRESSED_OPERATION_ERROR_MESSAGE,
+    )
+
+
+def deliver_notifications(
+    destinations: Sequence[str],
+    title: str,
+    body: str,
+    *,
+    apprise_factory: Callable[[], Any] = apprise.Apprise,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> tuple[DeliveryResult, ...]:
+    results: list[DeliveryResult] = []
+    for index, destination in enumerate(destinations):
+        scheme = extract_apprise_scheme(destination)
+        try:
+            previous_disable_level = logging.root.manager.disable
+            logging.disable(logging.CRITICAL)
+            try:
+                notifier = apprise_factory()
+                added = bool(notifier.add(destination))
+                success = bool(notifier.notify(title=title, body=body)) if added else False
+            finally:
+                logging.disable(previous_disable_level)
+        except Exception:
+            results.append(
+                DeliveryResult(
+                    index,
+                    scheme,
+                    clock(),
+                    False,
+                    APPRISE_EXCEPTION_ERROR_TYPE,
+                    APPRISE_EXCEPTION_ERROR_MESSAGE,
+                )
+            )
+            continue
+
+        if not added:
+            error_type = INVALID_DESTINATION_ERROR_TYPE
+            error_message = INVALID_DESTINATION_ERROR_MESSAGE
+        elif not success:
+            error_type = DELIVERY_FAILED_ERROR_TYPE
+            error_message = DELIVERY_FAILED_ERROR_MESSAGE
+        else:
+            error_type = None
+            error_message = None
+        results.append(
+            DeliveryResult(
+                index,
+                scheme,
+                clock(),
+                success,
+                error_type,
+                error_message,
+            )
+        )
+    return tuple(results)
+
+
+def utc_text(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("A timezone-aware timestamp is required.")
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def connect_database(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = DELETE")
+    except BaseException:
+        try:
+            connection.close()
+        except Exception:
+            LOGGER.warning("Database cleanup failed during connection initialization.")
+        raise
+    return connection
+
+
+def migrate_database(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > SCHEMA_VERSION:
+        raise DatabaseError(
+            f"Database schema {version} is newer than supported schema {SCHEMA_VERSION}."
+        )
+    if version == 0:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V1 + "\nCOMMIT;")
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        version = 1
+    if version == 1:
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_V2 + "\nCOMMIT;")
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+
+
+def recover_interrupted_checks(conn: sqlite3.Connection, recovered_at: datetime) -> int:
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE checks
+            SET completed_at = ?,
+                outcome = 'failed',
+                error_type = 'InterruptedRun',
+                error_message = 'The previous check was interrupted before completion.'
+            WHERE outcome = 'running'
+            """,
+            (utc_text(recovered_at),),
+        )
+    return cursor.rowcount
+
+
+def _get_or_create_manuscript(
+    conn: sqlite3.Connection,
+    account_id: int,
+    external_id: str,
+    created_at: str,
+) -> int:
+    row = conn.execute(
+        "SELECT id FROM manuscripts WHERE account_id = ? AND external_id = ?",
+        (account_id, external_id),
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = conn.execute(
+        "INSERT INTO manuscripts(account_id, external_id, created_at) VALUES (?, ?, ?)",
+        (account_id, external_id, created_at),
+    )
+    return int(cursor.lastrowid)
+
+
+def _open_tracking_period(
+    conn: sqlite3.Connection,
+    manuscript_id: int,
+    started_at: str,
+    reason: str,
+) -> int:
+    row = conn.execute(
+        "SELECT id FROM tracking_periods WHERE manuscript_id = ? AND ended_at IS NULL",
+        (manuscript_id,),
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = conn.execute(
+        "INSERT INTO tracking_periods(manuscript_id, started_at, started_reason) VALUES (?, ?, ?)",
+        (manuscript_id, started_at, reason),
+    )
+    return int(cursor.lastrowid)
+
+
+def _close_active_periods(
+    conn: sqlite3.Connection,
+    account_id: int,
+    ended_at: str,
+    reason: str,
+    *,
+    keep_external_ids: AbstractSet[str] = frozenset(),
+) -> None:
+    rows = conn.execute(
+        "SELECT tracking_periods.id, manuscripts.external_id "
+        "FROM tracking_periods "
+        "JOIN manuscripts ON manuscripts.id = tracking_periods.manuscript_id "
+        "WHERE manuscripts.account_id = ? AND tracking_periods.ended_at IS NULL",
+        (account_id,),
+    ).fetchall()
+    for row in rows:
+        if row["external_id"] in keep_external_ids:
+            continue
+        conn.execute(
+            "UPDATE tracking_periods SET ended_at = ?, ended_reason = ? WHERE id = ?",
+            (ended_at, reason, row["id"]),
+        )
+
+
+def reconcile_configuration(
+    conn: sqlite3.Connection,
+    accounts: Sequence[AccountConfig],
+    now: datetime,
+) -> dict[str, ReconciledAccount]:
+    reconciled: dict[str, ReconciledAccount] = {}
+    configured_names = {account.name for account in accounts}
+    changed_at = utc_text(now)
+
+    with conn:
+        account_rows = conn.execute(
+            "SELECT id, name, active, needs_initial_notification FROM accounts"
+        ).fetchall()
+        for row in account_rows:
+            if row["name"] in configured_names:
+                continue
+            account_id = int(row["id"])
+            if bool(row["active"]) or bool(row["needs_initial_notification"]):
+                conn.execute(
+                    "UPDATE accounts SET active = ?, needs_initial_notification = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (0, 0, changed_at, account_id),
+                )
+            conn.execute(
+                "UPDATE account_configurations SET active_until = ? "
+                "WHERE account_id = ? AND active_until IS NULL",
+                (changed_at, account_id),
+            )
+            _close_active_periods(conn, account_id, changed_at, "account_removal")
+
+        for config in accounts:
+            target_ids = frozenset(config.manuscript_ids)
+            account_row = conn.execute(
+                "SELECT id, active, needs_initial_notification FROM accounts WHERE name = ?",
+                (config.name,),
+            ).fetchone()
+            is_new = account_row is None
+            is_reactivated = account_row is not None and not bool(account_row["active"])
+            if account_row is None:
+                cursor = conn.execute(
+                    "INSERT INTO accounts(name, active, needs_initial_notification, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (config.name, 1, 1, changed_at, changed_at),
+                )
+                account_id = int(cursor.lastrowid)
+                needs_initial_notification = True
             else:
-                logging.info(f'Current status is "{status}", no update')
+                account_id = int(account_row["id"])
+                needs_initial_notification = bool(account_row["needs_initial_notification"])
+                if is_reactivated:
+                    needs_initial_notification = True
+                    conn.execute(
+                        "UPDATE accounts SET active = ?, needs_initial_notification = ?, "
+                        "updated_at = ? WHERE id = ?",
+                        (1, 1, changed_at, account_id),
+                    )
+
+            active_configuration = conn.execute(
+                "SELECT id, url, username, track_all FROM account_configurations "
+                "WHERE account_id = ? AND active_until IS NULL",
+                (account_id,),
+            ).fetchone()
+            configuration_id: int | None = None
+            if active_configuration is not None:
+                configuration_id = int(active_configuration["id"])
+                stored_targets = frozenset(
+                    row["external_id"]
+                    for row in conn.execute(
+                        "SELECT external_id FROM account_configuration_targets "
+                        "WHERE configuration_id = ?",
+                        (configuration_id,),
+                    ).fetchall()
+                )
+                identical = (
+                    active_configuration["url"] == config.url
+                    and active_configuration["username"] == config.username
+                    and bool(active_configuration["track_all"]) == config.track_all
+                    and stored_targets == target_ids
+                )
+                if not identical:
+                    conn.execute(
+                        "UPDATE account_configurations SET active_until = ? WHERE id = ?",
+                        (changed_at, configuration_id),
+                    )
+                    configuration_id = None
+
+            if configuration_id is None:
+                cursor = conn.execute(
+                    "INSERT INTO account_configurations(account_id, url, username, track_all, "
+                    "active_from) VALUES (?, ?, ?, ?, ?)",
+                    (account_id, config.url, config.username, int(config.track_all), changed_at),
+                )
+                configuration_id = int(cursor.lastrowid)
+                for external_id in sorted(target_ids):
+                    conn.execute(
+                        "INSERT INTO account_configuration_targets(configuration_id, external_id) "
+                        "VALUES (?, ?)",
+                        (configuration_id, external_id),
+                    )
+                if not is_new and not is_reactivated:
+                    conn.execute(
+                        "UPDATE accounts SET updated_at = ? WHERE id = ?",
+                        (changed_at, account_id),
+                    )
+
+            if not config.track_all:
+                _close_active_periods(
+                    conn,
+                    account_id,
+                    changed_at,
+                    "filter_removal",
+                    keep_external_ids=target_ids,
+                )
+                if is_new:
+                    period_reason = "account_activation"
+                elif is_reactivated:
+                    period_reason = "scope_reactivation"
+                else:
+                    period_reason = "filter_addition"
+                for external_id in sorted(target_ids):
+                    manuscript_id = _get_or_create_manuscript(
+                        conn,
+                        account_id,
+                        external_id,
+                        changed_at,
+                    )
+                    _open_tracking_period(
+                        conn,
+                        manuscript_id,
+                        changed_at,
+                        period_reason,
+                    )
+
+            reconciled[config.name] = ReconciledAccount(
+                account_id=account_id,
+                configuration_id=configuration_id,
+                config=config,
+                target_ids=target_ids,
+                needs_initial_notification=needs_initial_notification,
+            )
+
+    return reconciled
 
 
-def run():
-    '''
-    登录投稿网站，获取投稿状态
-    '''
-    # 指定chromedriver路径
-    my_service = Service(executable_path=DRIVER_PATH)
-    chrome_options = webdriver.ChromeOptions()
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--headless")
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    b = Browser(driver_name='chrome', service=my_service, options=chrome_options)
-    time.sleep(get_random_interval())
-    b.visit(URL)
-    time.sleep(get_random_interval())
-    b.fill('USERID', USER)
-    time.sleep(get_random_interval())
-    b.fill('PASSWORD', PWD)
-    time.sleep(get_random_interval())
-    # 点击登录按钮
-    wait = WebDriverWait(b.driver, 30)
-    e = wait.until(EC.element_to_be_clickable((By.ID, 'logInButton')))
-    b.driver.execute_script("arguments[0].click();", e)
-    time.sleep(get_random_interval())
-    # 切换到作者页面
-    html_obj = b.html
-    soup = BeautifulSoup(html_obj,"lxml")
-    li = soup.find_all("li", attrs={"class": "nav-link"})
-    for a in li:
-        author_tag = a.find("a")
-        if author_tag and author_tag.text.strip() == "Author":
-            b.driver.execute_script(author_tag["href"].split("javascript:")[-1])
-            break
-    time.sleep(get_random_interval())
-    html_obj = b.html
-    soup = BeautifulSoup(html_obj,"lxml")
-    table = soup.find("span", attrs={"class": "pagecontents"})
-    print(table.string)
-    current_manuscript_status = table.string
-    time.sleep(get_random_interval())
-    b.quit()
-    update_status(current_manuscript_status)
+def start_check(
+    conn: sqlite3.Connection,
+    configuration_id: int,
+    started_at: datetime,
+) -> int:
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO checks(configuration_id, started_at, outcome) "
+            "SELECT id, ?, 'running' FROM account_configurations "
+            "WHERE id = ? AND active_until IS NULL",
+            (utc_text(started_at), configuration_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The active account configuration was not found.")
+    return int(cursor.lastrowid)
 
 
-if __name__=="__main__":
-    run()
+def _accepted_snapshot(row: sqlite3.Row) -> ManuscriptSnapshot | None:
+    if not bool(row["accepted_present"]):
+        return None
+    return ManuscriptSnapshot(
+        external_id=row["external_id"],
+        title=row["accepted_title"],
+        submitted_text=row["accepted_submitted_text"],
+        submitted_date=date.fromisoformat(row["accepted_submitted_date"]),
+        status=row["accepted_status"],
+    )
+
+
+def _upsert_current_state(
+    conn: sqlite3.Connection,
+    update: ProjectionUpdate,
+    updated_at: str,
+) -> None:
+    cursor = conn.execute(
+        "INSERT INTO current_states(tracking_period_id, observation_id, updated_at) "
+        "VALUES (?, ?, ?) ON CONFLICT(tracking_period_id) DO UPDATE SET "
+        "observation_id = excluded.observation_id, updated_at = excluded.updated_at",
+        (update.tracking_period_id, update.observation_id, updated_at),
+    )
+    if cursor.rowcount != 1:
+        raise DatabaseError("The current state could not be updated.")
+
+
+def prepare_check(
+    conn: sqlite3.Connection,
+    account: ReconciledAccount,
+    check_id: int,
+    parsed: Sequence[ManuscriptSnapshot],
+    observed_at: datetime,
+) -> PreparedCheck:
+    observed_text = utc_text(observed_at)
+    parsed_count = len(parsed)
+    parsed_by_id = {snapshot.external_id: snapshot for snapshot in parsed}
+
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        check_row = conn.execute(
+            "SELECT checks.configuration_id, checks.outcome, checks.parsed_count, "
+            "account_configurations.account_id, account_configurations.url, "
+            "account_configurations.username, account_configurations.track_all, "
+            "account_configurations.active_until, accounts.name AS account_name, "
+            "accounts.active AS account_active, accounts.needs_initial_notification, "
+            "EXISTS(SELECT 1 FROM observations WHERE observations.check_id = checks.id) "
+            "AS has_observations, "
+            "EXISTS(SELECT 1 FROM notification_batches "
+            "WHERE notification_batches.check_id = checks.id) AS has_batch, "
+            "EXISTS(SELECT 1 FROM checks AS newer_checks "
+            "WHERE newer_checks.configuration_id = checks.configuration_id "
+            "AND newer_checks.id > checks.id) AS has_newer_check "
+            "FROM checks JOIN account_configurations "
+            "ON account_configurations.id = checks.configuration_id "
+            "JOIN accounts ON accounts.id = account_configurations.account_id "
+            "WHERE checks.id = ?",
+            (check_id,),
+        ).fetchone()
+        stored_targets = frozenset(
+            str(row["external_id"])
+            for row in conn.execute(
+                "SELECT external_id FROM account_configuration_targets WHERE configuration_id = ?",
+                (account.configuration_id,),
+            ).fetchall()
+        )
+        configured_targets = frozenset(account.config.manuscript_ids)
+        if (
+            check_row is None
+            or type(account.account_id) is not int
+            or type(account.configuration_id) is not int
+            or type(account.needs_initial_notification) is not bool
+            or type(account.target_ids) is not frozenset
+            or check_row["outcome"] != "running"
+            or int(check_row["configuration_id"]) != account.configuration_id
+            or int(check_row["account_id"]) != account.account_id
+            or str(check_row["account_name"]) != account.config.name
+            or not bool(check_row["account_active"])
+            or bool(check_row["needs_initial_notification"]) != account.needs_initial_notification
+            or str(check_row["url"]) != account.config.url
+            or str(check_row["username"]) != account.config.username
+            or bool(check_row["track_all"]) != account.config.track_all
+            or check_row["active_until"] is not None
+            or configured_targets != account.target_ids
+            or stored_targets != account.target_ids
+        ):
+            raise DatabaseError(
+                "The reconciled account does not match the durable account configuration."
+            )
+        if (
+            check_row["parsed_count"] is not None
+            or bool(check_row["has_observations"])
+            or bool(check_row["has_batch"])
+        ):
+            raise DatabaseError("The running check has already been prepared.")
+        if bool(check_row["has_newer_check"]):
+            raise DatabaseError("A newer check already exists for this account configuration.")
+        claim_cursor = conn.execute(
+            "UPDATE checks SET parsed_count = ? "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count IS NULL AND EXISTS ("
+            "SELECT 1 FROM account_configurations "
+            "WHERE account_configurations.id = checks.configuration_id "
+            "AND account_configurations.account_id = ? "
+            "AND account_configurations.track_all = ? "
+            "AND account_configurations.active_until IS NULL)",
+            (
+                parsed_count,
+                check_id,
+                account.configuration_id,
+                account.account_id,
+                int(account.config.track_all),
+            ),
+        )
+        if claim_cursor.rowcount != 1:
+            raise DatabaseError("The running check could not be claimed for preparation.")
+
+        if account.config.track_all:
+            current = parsed_by_id
+            for external_id in sorted(current):
+                manuscript_id = _get_or_create_manuscript(
+                    conn,
+                    account.account_id,
+                    external_id,
+                    observed_text,
+                )
+                _open_tracking_period(
+                    conn,
+                    manuscript_id,
+                    observed_text,
+                    "track_all_discovery",
+                )
+        else:
+            current = {
+                external_id: snapshot
+                for external_id, snapshot in parsed_by_id.items()
+                if external_id in account.target_ids
+            }
+
+        period_rows = conn.execute(
+            "SELECT tracking_periods.id AS tracking_period_id, "
+            "manuscripts.id AS manuscript_id, manuscripts.external_id, "
+            "current_states.observation_id AS accepted_observation_id, "
+            "accepted_observations.present AS accepted_present, "
+            "accepted_observations.title AS accepted_title, "
+            "accepted_observations.submitted_text AS accepted_submitted_text, "
+            "accepted_observations.submitted_date AS accepted_submitted_date, "
+            "accepted_observations.status AS accepted_status "
+            "FROM tracking_periods "
+            "JOIN manuscripts ON manuscripts.id = tracking_periods.manuscript_id "
+            "LEFT JOIN current_states "
+            "ON current_states.tracking_period_id = tracking_periods.id "
+            "LEFT JOIN observations AS accepted_observations "
+            "ON accepted_observations.id = current_states.observation_id "
+            "WHERE manuscripts.account_id = ? AND tracking_periods.ended_at IS NULL "
+            "ORDER BY manuscripts.external_id",
+            (account.account_id,),
+        ).fetchall()
+
+        accepted: dict[str, AcceptedState] = {}
+        for row in period_rows:
+            if row["accepted_observation_id"] is None:
+                continue
+            accepted[row["external_id"]] = AcceptedState(
+                tracking_period_id=int(row["tracking_period_id"]),
+                observation_id=int(row["accepted_observation_id"]),
+                present=bool(row["accepted_present"]),
+                snapshot=_accepted_snapshot(row),
+            )
+
+        observation_updates: dict[str, ProjectionUpdate] = {}
+        for row in period_rows:
+            external_id = row["external_id"]
+            snapshot = current.get(external_id)
+            if snapshot is None:
+                values: tuple[object, ...] = (0, None, None, None, None)
+            else:
+                values = (
+                    1,
+                    snapshot.title,
+                    snapshot.submitted_text,
+                    snapshot.submitted_date.isoformat(),
+                    snapshot.status,
+                )
+                cursor = conn.execute(
+                    "UPDATE manuscripts SET first_seen_at = COALESCE(first_seen_at, ?) "
+                    "WHERE id = ?",
+                    (observed_text, row["manuscript_id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise DatabaseError("The observed manuscript was not found.")
+            cursor = conn.execute(
+                "INSERT INTO observations(check_id, manuscript_id, tracking_period_id, "
+                "present, title, submitted_text, submitted_date, status, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    check_id,
+                    row["manuscript_id"],
+                    row["tracking_period_id"],
+                    *values,
+                    observed_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("The manuscript observation could not be stored.")
+            observation_updates[external_id] = ProjectionUpdate(
+                tracking_period_id=int(row["tracking_period_id"]),
+                observation_id=int(cursor.lastrowid),
+            )
+
+        events = calculate_events(
+            current,
+            accepted,
+            initial_verification=account.needs_initial_notification,
+        )
+        event_ids = {event.external_id for event in events}
+        deferred_updates: list[ProjectionUpdate] = []
+        for external_id, update in observation_updates.items():
+            if external_id in event_ids:
+                deferred_updates.append(update)
+            elif external_id in accepted or external_id in current:
+                _upsert_current_state(conn, update, observed_text)
+
+        message = build_notification(
+            account.config.name,
+            observed_at,
+            events,
+            initial_verification=account.needs_initial_notification,
+        )
+        batch: StoredNotificationBatch | None = None
+        if message is not None:
+            destination_count = len(account.config.apprise_urls)
+            if destination_count < 1:
+                raise DatabaseError("A notification batch requires at least one destination.")
+            cursor = conn.execute(
+                "INSERT INTO notification_batches(check_id, account_id, reason, title, body, "
+                "event_count, created_at, destination_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    check_id,
+                    account.account_id,
+                    message.reason,
+                    message.title,
+                    message.body,
+                    message.event_count,
+                    observed_text,
+                    destination_count,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("The notification batch could not be stored.")
+            batch = StoredNotificationBatch(
+                id=int(cursor.lastrowid),
+                title=message.title,
+                body=message.body,
+                event_count=message.event_count,
+                reason=message.reason,
+                destination_count=destination_count,
+            )
+
+    return PreparedCheck(
+        check_id=check_id,
+        account_id=account.account_id,
+        configuration_id=account.configuration_id,
+        parsed_count=parsed_count,
+        events=events,
+        batch=batch,
+        deferred_updates=tuple(deferred_updates),
+        clear_initial_on_commit=account.needs_initial_notification,
+    )
+
+
+def _validated_delivery_timestamp(result: DeliveryResult) -> str:
+    if (
+        type(result.destination_index) is not int
+        or result.destination_index < 0
+        or type(result.scheme) is not str
+        or APPRISE_SCHEME.fullmatch(result.scheme) is None
+        or type(result.attempted_at) is not datetime
+        or result.attempted_at.tzinfo is None
+        or result.attempted_at.utcoffset() is None
+        or type(result.success) is not bool
+    ):
+        raise DatabaseError("The delivery result is invalid.")
+    if result.success:
+        valid_outcome = result.error_type is None and result.error_message is None
+    else:
+        valid_outcome = (
+            type(result.error_type) is str
+            and type(result.error_message) is str
+            and (result.error_type, result.error_message) in ALLOWED_DELIVERY_FAILURES
+        )
+    if not valid_outcome:
+        raise DatabaseError("The delivery result is invalid.")
+    return utc_text(result.attempted_at)
+
+
+def record_delivery(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    result: DeliveryResult,
+) -> None:
+    attempted_at = _validated_delivery_timestamp(result)
+    with conn:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO notification_deliveries("
+                "batch_id, destination_index, scheme, attempted_at, success, error_type, "
+                "error_message) SELECT notification_batches.id, ?, ?, ?, ?, ?, ? "
+                "FROM notification_batches WHERE notification_batches.id = ? "
+                "AND notification_batches.committed_at IS NULL "
+                "AND ? < notification_batches.destination_count",
+                (
+                    result.destination_index,
+                    result.scheme,
+                    attempted_at,
+                    int(result.success),
+                    result.error_type,
+                    result.error_message,
+                    batch_id,
+                    result.destination_index,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise DatabaseError("The delivery attempt could not be recorded.") from None
+        if cursor.rowcount != 1:
+            raise DatabaseError("The delivery attempt does not match a planned destination.")
+
+
+def _prepared_event_projections(
+    prepared: PreparedCheck,
+) -> tuple[tuple[int, int, str], ...]:
+    if len(prepared.events) != len(prepared.deferred_updates):
+        raise DatabaseError("Prepared events and deferred projections must have equal counts.")
+    period_ids = [update.tracking_period_id for update in prepared.deferred_updates]
+    if len(period_ids) != len(set(period_ids)):
+        raise DatabaseError("Deferred projection periods must be unique.")
+    try:
+        projections = tuple(
+            (
+                update.tracking_period_id,
+                update.observation_id,
+                event.external_id,
+            )
+            for event, update in zip(
+                prepared.events,
+                prepared.deferred_updates,
+                strict=True,
+            )
+        )
+    except RuntimeError:
+        raise DatabaseError("The notification preparation claim is stale or mismatched.") from None
+    event_ids = [projection[2] for projection in projections]
+    if len(event_ids) != len(set(event_ids)):
+        raise DatabaseError("Prepared event manuscript IDs must be unique.")
+    return projections
+
+
+def _durable_event_projections(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    reason: str,
+) -> tuple[tuple[int, int, str], ...]:
+    rows = conn.execute(
+        "SELECT observations.id AS observation_id, observations.tracking_period_id, "
+        "observations.present, manuscripts.external_id, "
+        "current_states.observation_id AS current_observation_id, "
+        "state_observations.check_id AS current_check_id "
+        "FROM observations JOIN tracking_periods "
+        "ON tracking_periods.id = observations.tracking_period_id "
+        "AND tracking_periods.manuscript_id = observations.manuscript_id "
+        "JOIN manuscripts ON manuscripts.id = observations.manuscript_id "
+        "LEFT JOIN current_states "
+        "ON current_states.tracking_period_id = observations.tracking_period_id "
+        "LEFT JOIN observations AS state_observations "
+        "ON state_observations.id = current_states.observation_id "
+        "WHERE observations.check_id = ? AND manuscripts.account_id = ? "
+        "ORDER BY manuscripts.external_id, observations.tracking_period_id",
+        (prepared.check_id, prepared.account_id),
+    ).fetchall()
+    if reason not in {"initial_verification", "manuscript_changes"}:
+        raise DatabaseError("The notification batch reason is invalid.")
+
+    projections: list[tuple[int, int, str]] = []
+    for row in rows:
+        observation_id = int(row["observation_id"])
+        current_observation_id = row["current_observation_id"]
+        current_check_id = row["current_check_id"]
+        if current_check_id is not None and int(current_check_id) > prepared.check_id:
+            raise DatabaseError("A newer check has already advanced a prepared projection.")
+        if reason == "initial_verification":
+            pending = bool(row["present"])
+        else:
+            pending = (current_observation_id is None and bool(row["present"])) or (
+                current_observation_id is not None and int(current_observation_id) != observation_id
+            )
+        if pending:
+            projections.append(
+                (
+                    int(row["tracking_period_id"]),
+                    observation_id,
+                    str(row["external_id"]),
+                )
+            )
+    return tuple(projections)
+
+
+def _validate_prepared_batch(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+) -> None:
+    batch = prepared.batch
+    if batch is None:
+        raise DatabaseError("No notification batch is available for finalization.")
+    row = conn.execute(
+        "SELECT notification_batches.check_id, "
+        "notification_batches.account_id AS batch_account_id, "
+        "notification_batches.reason, notification_batches.title, "
+        "notification_batches.body, notification_batches.event_count, "
+        "notification_batches.destination_count, notification_batches.committed_at, "
+        "checks.configuration_id, "
+        "checks.outcome, checks.parsed_count, "
+        "account_configurations.account_id AS configuration_account_id, "
+        "account_configurations.active_until, accounts.active AS account_active, "
+        "accounts.needs_initial_notification "
+        "FROM notification_batches "
+        "JOIN checks ON checks.id = notification_batches.check_id "
+        "JOIN account_configurations "
+        "ON account_configurations.id = checks.configuration_id "
+        "JOIN accounts ON accounts.id = account_configurations.account_id "
+        "WHERE notification_batches.id = ?",
+        (batch.id,),
+    ).fetchone()
+    if (
+        row is None
+        or int(row["check_id"]) != prepared.check_id
+        or int(row["batch_account_id"]) != prepared.account_id
+        or int(row["configuration_id"]) != prepared.configuration_id
+        or int(row["configuration_account_id"]) != prepared.account_id
+        or row["active_until"] is not None
+        or not bool(row["account_active"])
+        or row["outcome"] != "running"
+        or row["parsed_count"] is None
+        or int(row["parsed_count"]) != prepared.parsed_count
+        or row["committed_at"] is not None
+        or row["reason"] != batch.reason
+        or row["title"] != batch.title
+        or row["body"] != batch.body
+        or int(row["event_count"]) != batch.event_count
+        or int(row["destination_count"]) != batch.destination_count
+    ):
+        raise DatabaseError("The prepared notification batch is stale or mismatched.")
+
+    stored_initial = row["reason"] == "initial_verification"
+    if (
+        stored_initial != prepared.clear_initial_on_commit
+        or bool(row["needs_initial_notification"]) != prepared.clear_initial_on_commit
+        or batch.event_count != len(prepared.events)
+        or batch.event_count != len(prepared.deferred_updates)
+    ):
+        raise DatabaseError("The notification preparation claim is stale or mismatched.")
+    prepared_projections = _prepared_event_projections(prepared)
+    durable_projections = _durable_event_projections(conn, prepared, str(row["reason"]))
+    if len(durable_projections) != batch.event_count or prepared_projections != durable_projections:
+        raise DatabaseError("Prepared events do not match the durable pending projections.")
+
+
+def _validated_delivery_plan(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    destination_count: int,
+) -> bool:
+    if type(destination_count) is not int or destination_count < 1:
+        raise DatabaseError("The delivery attempt plan is incomplete or invalid.")
+    rows = conn.execute(
+        "SELECT destination_index, success FROM notification_deliveries "
+        "WHERE batch_id = ? ORDER BY destination_index",
+        (batch_id,),
+    ).fetchall()
+    indices = tuple(int(row["destination_index"]) for row in rows)
+    if indices != tuple(range(destination_count)):
+        raise DatabaseError("The delivery attempt plan is incomplete or invalid.")
+    return any(bool(row["success"]) for row in rows)
+
+
+def commit_prepared_check(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    committed_at: datetime,
+) -> None:
+    if prepared.batch is None:
+        raise DatabaseError("No notification batch is available to commit.")
+    timestamp = utc_text(committed_at)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_prepared_batch(conn, prepared)
+        succeeded = _validated_delivery_plan(
+            conn,
+            prepared.batch.id,
+            prepared.batch.destination_count,
+        )
+        if not succeeded:
+            raise DatabaseError(
+                "An uncommitted matching batch with a successful delivery is required."
+            )
+        batch_cursor = conn.execute(
+            "UPDATE notification_batches SET committed_at = ? "
+            "WHERE id = ? AND check_id = ? AND account_id = ? AND committed_at IS NULL",
+            (timestamp, prepared.batch.id, prepared.check_id, prepared.account_id),
+        )
+        if batch_cursor.rowcount != 1:
+            raise DatabaseError("The notification batch is stale or mismatched.")
+
+        for update in prepared.deferred_updates:
+            state_cursor = conn.execute(
+                "INSERT INTO current_states(tracking_period_id, observation_id, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(tracking_period_id) DO UPDATE SET "
+                "observation_id = excluded.observation_id, updated_at = excluded.updated_at",
+                (update.tracking_period_id, update.observation_id, timestamp),
+            )
+            if state_cursor.rowcount != 1:
+                raise DatabaseError("A deferred projection could not be committed.")
+
+        if prepared.clear_initial_on_commit:
+            account_cursor = conn.execute(
+                "UPDATE accounts SET needs_initial_notification = 0, updated_at = ? "
+                "WHERE id = ? AND active = 1 AND needs_initial_notification = 1",
+                (timestamp, prepared.account_id),
+            )
+            if account_cursor.rowcount != 1:
+                raise DatabaseError("The account notification state is stale or mismatched.")
+
+        check_cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'succeeded', "
+            "error_type = NULL, error_message = NULL "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count = ? AND EXISTS ("
+            "SELECT 1 FROM account_configurations JOIN accounts "
+            "ON accounts.id = account_configurations.account_id "
+            "WHERE account_configurations.id = checks.configuration_id "
+            "AND account_configurations.account_id = ? "
+            "AND account_configurations.active_until IS NULL AND accounts.active = 1)",
+            (
+                timestamp,
+                prepared.check_id,
+                prepared.configuration_id,
+                prepared.parsed_count,
+                prepared.account_id,
+            ),
+        )
+        if check_cursor.rowcount != 1:
+            raise DatabaseError("The prepared check is stale or mismatched.")
+
+
+def fail_prepared_check(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    completed_at: datetime,
+    error: RedactedError,
+) -> None:
+    if prepared.batch is None:
+        raise DatabaseError("No notification batch is available to fail.")
+    timestamp = utc_text(completed_at)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _validate_prepared_batch(conn, prepared)
+        succeeded = _validated_delivery_plan(
+            conn,
+            prepared.batch.id,
+            prepared.batch.destination_count,
+        )
+        if succeeded:
+            raise DatabaseError("Only an uncommitted batch without a success may fail.")
+        cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'failed', "
+            "error_type = ?, error_message = ? "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count = ? AND EXISTS ("
+            "SELECT 1 FROM account_configurations JOIN accounts "
+            "ON accounts.id = account_configurations.account_id "
+            "WHERE account_configurations.id = checks.configuration_id "
+            "AND account_configurations.account_id = ? "
+            "AND account_configurations.active_until IS NULL AND accounts.active = 1)",
+            (
+                timestamp,
+                error.error_type,
+                error.error_message,
+                prepared.check_id,
+                prepared.configuration_id,
+                prepared.parsed_count,
+                prepared.account_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The prepared check is stale or mismatched.")
+
+
+def complete_check_without_notification(
+    conn: sqlite3.Connection,
+    prepared: PreparedCheck,
+    completed_at: datetime,
+) -> None:
+    if prepared.batch is not None:
+        raise DatabaseError("A notification batch requires delivery finalization.")
+    with conn:
+        cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'succeeded', "
+            "error_type = NULL, error_message = NULL "
+            "WHERE id = ? AND configuration_id = ? AND outcome = 'running' "
+            "AND parsed_count = ? "
+            "AND NOT EXISTS (SELECT 1 FROM notification_batches "
+            "WHERE notification_batches.check_id = checks.id)",
+            (
+                utc_text(completed_at),
+                prepared.check_id,
+                prepared.configuration_id,
+                prepared.parsed_count,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The prepared check is no longer running.")
+
+
+def fail_check(
+    conn: sqlite3.Connection,
+    check_id: int,
+    completed_at: datetime,
+    error: RedactedError,
+) -> None:
+    with conn:
+        cursor = conn.execute(
+            "UPDATE checks SET completed_at = ?, outcome = 'failed', error_type = ?, "
+            "error_message = ? WHERE id = ? AND outcome = 'running'",
+            (utc_text(completed_at), error.error_type, error.error_message, check_id),
+        )
+        if cursor.rowcount != 1:
+            raise DatabaseError("The check is no longer running.")
+
+
+def create_chrome_driver(
+    config: BrowserConfig,
+    environ: Mapping[str, str],
+) -> Any:
+    options = webdriver.ChromeOptions()
+    if config.headless:
+        options.add_argument("--headless=new")
+    binary = config.binary_path or (
+        Path(environ["CHROME_BIN"]) if environ.get("CHROME_BIN") else None
+    )
+    if binary is not None:
+        options.binary_location = str(binary)
+    if environ.get("RUNNING_IN_DOCKER") == "1":
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+
+    driver_path = config.driver_path or (
+        Path(environ["CHROMEDRIVER_PATH"]) if environ.get("CHROMEDRIVER_PATH") else None
+    )
+    kwargs: dict[str, Any] = {"options": options}
+    if driver_path is not None:
+        kwargs["service"] = Service(executable_path=str(driver_path))
+    driver = webdriver.Chrome(**kwargs)
+    try:
+        driver.set_page_load_timeout(config.page_load_timeout_seconds)
+    except Exception:
+        try:
+            driver.quit()
+        except Exception:
+            LOGGER.warning("Browser cleanup failed during driver initialization.")
+        raise
+    return driver
+
+
+def _validated_complete_dashboard_html(payload: object) -> str:
+    if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+    html = payload.get("html")
+    row_count = payload.get("row_count")
+    total = payload.get("total")
+    if (
+        type(html) is not str
+        or type(row_count) is not int
+        or type(total) is not int
+        or row_count < 0
+        or total < 0
+        or row_count != total
+    ):
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+
+    document = BeautifulSoup(html, "html.parser")
+    table = document.find("table", id="authorDashboardQueue")
+    if not isinstance(table, Tag):
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+    try:
+        rows = _dashboard_rows(table)
+        external_ids = [
+            normalize_manuscript_id(
+                _dashboard_cell(row, "ID", row_number).get_text(" ", strip=True)
+            )
+            for row_number, row in enumerate(rows, start=1)
+        ]
+    except DashboardParseError:
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE) from None
+    if (
+        len(rows) != total
+        or any(not external_id for external_id in external_ids)
+        or len(set(external_ids)) != total
+    ):
+        raise BrowserCaptureError(INCOMPLETE_DASHBOARD_CAPTURE_MESSAGE)
+    return html
+
+
+def capture_dashboard_html(
+    account: AccountConfig,
+    browser: BrowserConfig,
+    *,
+    environ: Mapping[str, str],
+    driver_factory: Callable[[BrowserConfig, Mapping[str, str]], Any] = create_chrome_driver,
+    wait_factory: Callable[[Any, int], Any] = WebDriverWait,
+) -> str:
+    driver: Any | None = None
+    try:
+        driver = driver_factory(browser, environ)
+        driver.get(account.url)
+        wait = wait_factory(driver, browser.element_timeout_seconds)
+        username = wait.until(EC.presence_of_element_located((By.NAME, "USERID")))
+        username.clear()
+        username.send_keys(account.username)
+        password = wait.until(EC.presence_of_element_located((By.NAME, "PASSWORD")))
+        password.clear()
+        password.send_keys(account.password)
+        login = wait.until(EC.element_to_be_clickable((By.ID, "logInButton")))
+        driver.execute_script("arguments[0].click();", login)
+
+        def find_author(current_driver: Any) -> Any:
+            for link in current_driver.find_elements(By.CSS_SELECTOR, "li.nav-link a"):
+                if normalize_whitespace(link.text) == "Author":
+                    return link
+            return False
+
+        author = wait.until(find_author)
+        href = author.get_attribute("href") or ""
+        if href.lower().startswith("javascript:"):
+            driver.execute_script(href.split(":", 1)[1])
+        else:
+            author.click()
+        wait.until(EC.presence_of_element_located((By.ID, "authorDashboardQueue")))
+        if hasattr(driver, "set_script_timeout"):
+            driver.set_script_timeout(browser.element_timeout_seconds + 1)
+        payload = driver.execute_async_script(
+            DASHBOARD_CAPTURE_SCRIPT,
+            "#authorDashboardQueue",
+            max((browser.element_timeout_seconds - 1) * 1000, 1000),
+        )
+        return _validated_complete_dashboard_html(payload)
+    except BrowserCaptureError:
+        raise
+    except Exception as exc:
+        raise BrowserCaptureError(f"Browser capture failed with {type(exc).__name__}.") from exc
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                LOGGER.warning("Browser cleanup failed for account %s.", account.name)
+
+
+def normalize_whitespace(value: str) -> str:
+    return " ".join(value.split())
+
+
+def normalize_manuscript_id(value: str) -> str:
+    return normalize_whitespace(value.split("(", 1)[0])
+
+
+def parse_submitted_date(value: str) -> date:
+    match = SUBMITTED_DATE.fullmatch(normalize_whitespace(value))
+    if match is None:
+        raise DashboardParseError("Submission date must use DD-Mon-YYYY.")
+    try:
+        return date(
+            int(match.group("year")),
+            ENGLISH_MONTHS[match.group("month")],
+            int(match.group("day")),
+        )
+    except ValueError as exc:
+        raise DashboardParseError("Submission date is invalid.") from exc
+
+
+def _dashboard_rows(table: Tag) -> list[Tag]:
+    tbody = table.find("tbody", recursive=False)
+    if isinstance(tbody, Tag):
+        return [row for row in tbody.find_all("tr", recursive=False) if isinstance(row, Tag)]
+
+    direct_rows = [row for row in table.find_all("tr", recursive=False) if isinstance(row, Tag)]
+    has_manuscript_row = any(
+        row.find("td", attrs={"data-label": True}, recursive=False) is not None
+        for row in direct_rows
+    )
+    if not has_manuscript_row:
+        raise DashboardParseError("Dashboard row structure is missing.")
+    return direct_rows
+
+
+def _dashboard_cell(row: Tag, label: str, row_number: int) -> Tag:
+    cell = row.find("td", attrs={"data-label": label}, recursive=False)
+    if not isinstance(cell, Tag):
+        raise DashboardParseError(f"Dashboard row {row_number} is missing the {label} cell.")
+    return cell
+
+
+def _required_dashboard_text(value: str, field: str, row_number: int) -> str:
+    normalized = normalize_whitespace(value)
+    if not normalized:
+        raise DashboardParseError(f"Dashboard row {row_number} has an empty {field} field.")
+    return normalized
+
+
+def parse_dashboard(html: str) -> tuple[ManuscriptSnapshot, ...]:
+    document = BeautifulSoup(html, "html.parser")
+    table = document.find("table", id="authorDashboardQueue")
+    if not isinstance(table, Tag):
+        raise DashboardParseError("Dashboard table #authorDashboardQueue is missing.")
+
+    snapshots: list[ManuscriptSnapshot] = []
+    seen_ids: set[str] = set()
+    for row_number, row in enumerate(_dashboard_rows(table), start=1):
+        status_cell = _dashboard_cell(row, "status", row_number)
+        status_element = status_cell.select_one("span.pagecontents")
+        if not isinstance(status_element, Tag):
+            raise DashboardParseError(f"Dashboard row {row_number} is missing its status value.")
+        status = _required_dashboard_text(
+            status_element.get_text(" ", strip=True),
+            "status",
+            row_number,
+        )
+
+        id_cell = _dashboard_cell(row, "ID", row_number)
+        external_id = normalize_manuscript_id(id_cell.get_text(" ", strip=True))
+        if not external_id:
+            raise DashboardParseError(f"Dashboard row {row_number} has an empty ID field.")
+        if external_id in seen_ids:
+            raise DashboardParseError(
+                f"Dashboard contains duplicate manuscript ID {external_id!r}."
+            )
+        seen_ids.add(external_id)
+
+        title_cell = _dashboard_cell(row, "title", row_number)
+        title_document = BeautifulSoup(str(title_cell), "html.parser")
+        for anchor in title_document.find_all("a"):
+            anchor.decompose()
+        title = _required_dashboard_text(
+            title_document.get_text(" ", strip=True),
+            "title",
+            row_number,
+        )
+
+        submitted_cell = _dashboard_cell(row, "submitted", row_number)
+        submitted_text = _required_dashboard_text(
+            submitted_cell.get_text(" ", strip=True),
+            "submitted",
+            row_number,
+        )
+        try:
+            submitted_date = parse_submitted_date(submitted_text)
+        except DashboardParseError as exc:
+            raise DashboardParseError(
+                f"Dashboard row {row_number} has an invalid submission date: {exc}"
+            ) from exc
+
+        snapshots.append(
+            ManuscriptSnapshot(
+                external_id=external_id,
+                title=title,
+                submitted_text=submitted_text,
+                submitted_date=submitted_date,
+                status=status,
+            )
+        )
+
+    return tuple(snapshots)
+
+
+def expand_environment(value: str, environ: Mapping[str, str]) -> str:
+    frames: list[list[Any]] = [[value, None, set(), None]]
+    active_names: set[str] = set()
+    substitutions = 0
+    work_chars = 0
+    while frames:
+        current: str = frames[-1][0]
+        current_length = len(current)
+        if current_length > MAX_ENVIRONMENT_OUTPUT_CHARS:
+            raise ConfigError((ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE,))
+        work_chars += current_length * 2
+        if work_chars > MAX_ENVIRONMENT_WORK_CHARS:
+            raise ConfigError((ENVIRONMENT_WORK_LIMIT_ERROR_MESSAGE,))
+        state = (
+            current_length,
+            sha256(current.encode("utf-8", errors="surrogatepass")).digest(),
+        )
+        seen_states: set[tuple[int, bytes]] = frames[-1][2]
+        if state in seen_states:
+            raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
+        seen_states.add(state)
+        match = ENVIRONMENT_REFERENCE.search(current)
+        if match is not None:
+            name = match.group(1)
+            if name not in environ:
+                raise ConfigError((ENVIRONMENT_UNSET_ERROR_MESSAGE,))
+            if name in active_names:
+                raise ConfigError((ENVIRONMENT_CYCLE_ERROR_MESSAGE,))
+            substitutions += 1
+            if substitutions > MAX_ENVIRONMENT_SUBSTITUTIONS:
+                raise ConfigError((ENVIRONMENT_SUBSTITUTION_LIMIT_ERROR_MESSAGE,))
+            frames[-1][1] = match.span()
+            active_names.add(name)
+            frames.append([environ[name], None, set(), name])
+            continue
+
+        resolved = current
+        resolved_frame = frames.pop()
+        active_name: str | None = resolved_frame[3]
+        if active_name is not None:
+            active_names.remove(active_name)
+        if not frames:
+            return resolved
+        start, end = frames[-1][1]
+        parent: str = frames[-1][0]
+        expanded_length = len(parent) - (end - start) + len(resolved)
+        if expanded_length > MAX_ENVIRONMENT_OUTPUT_CHARS:
+            raise ConfigError((ENVIRONMENT_OUTPUT_LIMIT_ERROR_MESSAGE,))
+        work_chars += expanded_length
+        if work_chars > MAX_ENVIRONMENT_WORK_CHARS:
+            raise ConfigError((ENVIRONMENT_WORK_LIMIT_ERROR_MESSAGE,))
+        frames[-1][0] = parent[:start] + resolved + parent[end:]
+        frames[-1][1] = None
+    raise RuntimeError("Environment expansion ended without a result.")
+
+
+def _add_unknown_key_errors(
+    value: Mapping[str, object],
+    *,
+    allowed: AbstractSet[str],
+    path: str,
+    errors: list[str],
+) -> None:
+    count = sum(key not in allowed for key in value)
+    if count:
+        noun = "key" if count == 1 else "keys"
+        errors.append(f"{path}: contains {count} unknown {noun}.")
+
+
+def _read_mapping(
+    value: object,
+    *,
+    path: str,
+    errors: list[str],
+) -> Mapping[str, object] | None:
+    if value is _MISSING:
+        errors.append(f"{path}: is required.")
+        return None
+    if not isinstance(value, Mapping):
+        errors.append(f"{path}: must be a table.")
+        return None
+    return value
+
+
+def _read_string(
+    value: object,
+    *,
+    path: str,
+    environ: Mapping[str, str],
+    errors: list[str],
+    strip: bool = True,
+    allow_empty: bool = False,
+) -> str | None:
+    if value is _MISSING:
+        errors.append(f"{path}: is required.")
+        return None
+    if not isinstance(value, str):
+        errors.append(f"{path}: must be a string.")
+        return None
+    try:
+        expanded = expand_environment(value, environ)
+    except ConfigError as exc:
+        errors.extend(f"{path}: {message}" for message in exc.errors)
+        return None
+    result = expanded.strip() if strip else expanded
+    if not allow_empty and not result:
+        errors.append(f"{path}: must not be empty.")
+        return None
+    return result
+
+
+def _read_positive_integer(
+    value: object,
+    *,
+    path: str,
+    errors: list[str],
+) -> int | None:
+    if value is _MISSING:
+        errors.append(f"{path}: is required.")
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        errors.append(f"{path}: must be a positive integer.")
+        return None
+    return value
+
+
+def _resolve_path(value: str, *, config_dir: Path, path: str, errors: list[str]) -> Path | None:
+    try:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = config_dir / candidate
+        return candidate.resolve()
+    except (OSError, RuntimeError):
+        errors.append(f"{path}: could not be resolved.")
+        return None
+
+
+def _parse_storage(
+    raw: object,
+    *,
+    config_dir: Path,
+    environ: Mapping[str, str],
+    errors: list[str],
+) -> StorageConfig | None:
+    value = _read_mapping(raw, path="storage", errors=errors)
+    if value is None:
+        return None
+    _add_unknown_key_errors(value, allowed=STORAGE_KEYS, path="storage", errors=errors)
+    database_value = _read_string(
+        value.get("database_path", _MISSING),
+        path="storage.database_path",
+        environ=environ,
+        errors=errors,
+    )
+    if database_value is None:
+        return None
+    database_path = _resolve_path(
+        database_value,
+        config_dir=config_dir,
+        path="storage.database_path",
+        errors=errors,
+    )
+    if database_path is None:
+        return None
+    return StorageConfig(database_path=database_path)
+
+
+def _parse_browser(
+    raw: object,
+    *,
+    config_dir: Path,
+    environ: Mapping[str, str],
+    errors: list[str],
+) -> BrowserConfig | None:
+    value = _read_mapping(raw, path="browser", errors=errors)
+    if value is None:
+        return None
+    _add_unknown_key_errors(value, allowed=BROWSER_KEYS, path="browser", errors=errors)
+
+    headless_value = value.get("headless", _MISSING)
+    if not isinstance(headless_value, bool):
+        errors.append("browser.headless: must be a boolean.")
+        headless = None
+    else:
+        headless = headless_value
+
+    element_timeout = _read_positive_integer(
+        value.get("element_timeout_seconds", _MISSING),
+        path="browser.element_timeout_seconds",
+        errors=errors,
+    )
+    page_load_timeout = _read_positive_integer(
+        value.get("page_load_timeout_seconds", _MISSING),
+        path="browser.page_load_timeout_seconds",
+        errors=errors,
+    )
+
+    optional_paths: dict[str, Path | None] = {"binary_path": None, "driver_path": None}
+    for key in optional_paths:
+        if key not in value:
+            continue
+        field_path = f"browser.{key}"
+        path_value = _read_string(
+            value[key],
+            path=field_path,
+            environ=environ,
+            errors=errors,
+        )
+        if path_value is not None:
+            optional_paths[key] = _resolve_path(
+                path_value,
+                config_dir=config_dir,
+                path=field_path,
+                errors=errors,
+            )
+
+    if headless is None or element_timeout is None or page_load_timeout is None:
+        return None
+    return BrowserConfig(
+        headless=headless,
+        element_timeout_seconds=element_timeout,
+        page_load_timeout_seconds=page_load_timeout,
+        binary_path=optional_paths["binary_path"],
+        driver_path=optional_paths["driver_path"],
+    )
+
+
+def _parse_account(
+    raw: object,
+    *,
+    index: int,
+    environ: Mapping[str, str],
+    seen_names: dict[str, int],
+    errors: list[str],
+) -> AccountConfig | None:
+    account_path = f"accounts[{index}]"
+    value = _read_mapping(raw, path=account_path, errors=errors)
+    if value is None:
+        return None
+    error_count = len(errors)
+    _add_unknown_key_errors(value, allowed=ACCOUNT_KEYS, path=account_path, errors=errors)
+
+    name = _read_string(
+        value.get("name", _MISSING),
+        path=f"{account_path}.name",
+        environ=environ,
+        errors=errors,
+    )
+    if name is not None:
+        if name in seen_names:
+            errors.append(
+                f"{account_path}.name: duplicates account name at position {seen_names[name]}."
+            )
+        else:
+            seen_names[name] = index
+
+    url = _read_string(
+        value.get("url", _MISSING),
+        path=f"{account_path}.url",
+        environ=environ,
+        errors=errors,
+    )
+    if url is not None:
+        try:
+            parts = urlsplit(url)
+            valid_url = parts.scheme.lower() in {"http", "https"} and parts.hostname is not None
+        except ValueError:
+            valid_url = False
+        if not valid_url:
+            errors.append(f"{account_path}.url: must be an HTTP(S) URL.")
+
+    username = _read_string(
+        value.get("username", _MISSING),
+        path=f"{account_path}.username",
+        environ=environ,
+        errors=errors,
+    )
+    password = _read_string(
+        value.get("password", _MISSING),
+        path=f"{account_path}.password",
+        environ=environ,
+        errors=errors,
+        strip=False,
+        allow_empty=True,
+    )
+
+    manuscript_ids: tuple[str, ...] | None = None
+    manuscript_values = value.get("manuscript_ids", _MISSING)
+    if manuscript_values is _MISSING:
+        errors.append(f"{account_path}.manuscript_ids: is required.")
+    elif not isinstance(manuscript_values, list):
+        errors.append(f"{account_path}.manuscript_ids: must be an array.")
+    else:
+        normalized_ids: list[str] = []
+        for manuscript_index, manuscript_value in enumerate(manuscript_values):
+            manuscript_path = f"{account_path}.manuscript_ids[{manuscript_index}]"
+            expanded_id = _read_string(
+                manuscript_value,
+                path=manuscript_path,
+                environ=environ,
+                errors=errors,
+                strip=False,
+                allow_empty=True,
+            )
+            if expanded_id is None:
+                continue
+            normalized_id = normalize_manuscript_id(expanded_id)
+            if not normalized_id:
+                errors.append(f"{manuscript_path}: must not be empty after normalization.")
+                continue
+            normalized_ids.append(normalized_id)
+        manuscript_ids = tuple(dict.fromkeys(normalized_ids))
+
+    apprise_urls: tuple[str, ...] | None = None
+    destination_values = value.get("apprise_urls", _MISSING)
+    if destination_values is _MISSING:
+        errors.append(f"{account_path}.apprise_urls: is required.")
+    elif not isinstance(destination_values, list):
+        errors.append(f"{account_path}.apprise_urls: must be an array.")
+    elif not destination_values:
+        errors.append(f"{account_path}.apprise_urls: must contain at least one destination.")
+    else:
+        parsed_destinations: list[str] = []
+        seen_destinations: dict[str, int] = {}
+        for destination_index, destination_value in enumerate(destination_values):
+            destination_path = f"{account_path}.apprise_urls[{destination_index}]"
+            destination = _read_string(
+                destination_value,
+                path=destination_path,
+                environ=environ,
+                errors=errors,
+            )
+            if destination is None:
+                continue
+            if destination in seen_destinations:
+                errors.append(
+                    f"{destination_path}: duplicates destination at position "
+                    f"{seen_destinations[destination]}."
+                )
+            else:
+                seen_destinations[destination] = destination_index
+            parsed_destinations.append(destination)
+        apprise_urls = tuple(parsed_destinations)
+
+    if len(errors) != error_count:
+        return None
+    assert name is not None
+    assert url is not None
+    assert username is not None
+    assert password is not None
+    assert manuscript_ids is not None
+    assert apprise_urls is not None
+    return AccountConfig(
+        name=name,
+        url=url,
+        username=username,
+        password=password,
+        manuscript_ids=manuscript_ids,
+        apprise_urls=apprise_urls,
+    )
+
+
+def parse_config(
+    raw: Mapping[str, object],
+    *,
+    config_dir: Path,
+    environ: Mapping[str, str],
+) -> AppConfig:
+    errors: list[str] = []
+    _add_unknown_key_errors(raw, allowed=ROOT_KEYS, path="root", errors=errors)
+
+    storage = _parse_storage(
+        raw.get("storage", _MISSING),
+        config_dir=config_dir,
+        environ=environ,
+        errors=errors,
+    )
+    browser = _parse_browser(
+        raw.get("browser", _MISSING),
+        config_dir=config_dir,
+        environ=environ,
+        errors=errors,
+    )
+
+    accounts: list[AccountConfig] = []
+    account_values = raw.get("accounts", _MISSING)
+    if account_values is _MISSING:
+        errors.append("accounts: is required.")
+    elif not isinstance(account_values, list):
+        errors.append("accounts: must be an array of tables.")
+    else:
+        seen_names: dict[str, int] = {}
+        for index, account_value in enumerate(account_values):
+            account = _parse_account(
+                account_value,
+                index=index,
+                environ=environ,
+                seen_names=seen_names,
+                errors=errors,
+            )
+            if account is not None:
+                accounts.append(account)
+
+    if errors:
+        raise ConfigError(errors)
+    assert storage is not None
+    assert browser is not None
+    return AppConfig(storage=storage, browser=browser, accounts=tuple(accounts))
+
+
+def load_config(
+    path: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> AppConfig:
+    try:
+        config_path = path.expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError((f"Unable to load configuration: {type(exc).__name__}.",)) from exc
+    try:
+        with config_path.open("rb") as stream:
+            raw = tomllib.load(stream)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError((f"Unable to load configuration: {type(exc).__name__}.",)) from exc
+    return parse_config(
+        raw,
+        config_dir=config_path.parent,
+        environ=os.environ if environ is None else environ,
+    )
+
+
+def check_account(
+    conn: sqlite3.Connection,
+    account: ReconciledAccount,
+    browser: BrowserConfig,
+    *,
+    environ: Mapping[str, str],
+    driver_factory: Callable[..., Any],
+    wait_factory: Callable[..., Any],
+    apprise_factory: Callable[[], Any],
+    clock: Callable[[], datetime],
+) -> bool:
+    check_id = start_check(conn, account.configuration_id, clock())
+    try:
+        html = capture_dashboard_html(
+            account.config,
+            browser,
+            environ=environ,
+            driver_factory=driver_factory,
+            wait_factory=wait_factory,
+        )
+        parsed = parse_dashboard(html)
+        prepared = prepare_check(conn, account, check_id, parsed, clock())
+    except (BrowserCaptureError, DashboardParseError) as exc:
+        error = redact_exception(
+            exc,
+            (account.config.password, *account.config.apprise_urls),
+        )
+        fail_check(conn, check_id, clock(), error)
+        LOGGER.error(
+            "Account %s failed during capture or parsing: %s",
+            account.config.name,
+            error.error_type,
+        )
+        return False
+
+    if prepared.batch is None:
+        complete_check_without_notification(conn, prepared, clock())
+        return True
+
+    results = deliver_notifications(
+        account.config.apprise_urls,
+        prepared.batch.title,
+        prepared.batch.body,
+        apprise_factory=apprise_factory,
+        clock=clock,
+    )
+    for result in results:
+        record_delivery(conn, prepared.batch.id, result)
+    if any(result.success for result in results):
+        commit_prepared_check(conn, prepared, clock())
+        return True
+
+    fail_prepared_check(
+        conn,
+        prepared,
+        clock(),
+        RedactedError(
+            "NotificationDeliveryError",
+            "Every Apprise destination failed.",
+        ),
+    )
+    LOGGER.error(
+        "Account %s failed because every notification destination failed.",
+        account.config.name,
+    )
+    return False
+
+
+def run_once(
+    config: AppConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+    driver_factory: Callable[..., Any] = create_chrome_driver,
+    wait_factory: Callable[..., Any] = WebDriverWait,
+    apprise_factory: Callable[[], Any] = apprise.Apprise,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> int:
+    runtime_environment = os.environ if environ is None else environ
+    database_path = config.storage.database_path
+    try:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(f"{database_path}.lock", timeout=0)
+        with lock:
+            conn = connect_database(database_path)
+            try:
+                migrate_database(conn)
+                recover_interrupted_checks(conn, clock())
+                reconciled = reconcile_configuration(conn, config.accounts, clock())
+                outcomes = [
+                    check_account(
+                        conn,
+                        reconciled[account.name],
+                        config.browser,
+                        environ=runtime_environment,
+                        driver_factory=driver_factory,
+                        wait_factory=wait_factory,
+                        apprise_factory=apprise_factory,
+                        clock=clock,
+                    )
+                    for account in config.accounts
+                ]
+                return 0 if all(outcomes) else 1
+            finally:
+                conn.close()
+    except FileLockTimeout:
+        LOGGER.error("Another check is already using the configured database.")
+        return 1
+    except (OSError, sqlite3.Error, DatabaseError) as exc:
+        LOGGER.exception(
+            "The database or process lock operation failed (%s): %s", type(exc).__name__, exc
+        )
+        return 1
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Check ScholarOne manuscript statuses once and send Apprise notifications."
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.toml"),
+        help="Path to config.toml (default: ./config.toml).",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        LOGGER.error("%s", exc)
+        return 2
+    return run_once(config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
