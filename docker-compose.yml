@@ -2,8 +2,20 @@ services:
   checker:
     build:
       context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+      ulimits:
+        nofile:
+          soft: 65536
+          hard: 65536
     init: true
+    # 不要再设置 user
+    # Dockerfile 中已经创建了具有正确 UID/GID 的 app 用户
+    # user: ${UID}:${GID}
     restart: unless-stopped
+    networks:
+      - check-submission-status-net
     env_file:
       - .env
     environment:
@@ -13,8 +25,13 @@ services:
       CRON_SCHEDULE: ${CRON_SCHEDULE:?Set CRON_SCHEDULE in .env}
       TZ: ${TZ:-UTC}
     volumes:
-      - ./config.toml:/app/config.toml:ro
-      - submission-data:/app/data
+      - type: bind
+        source: ./config.toml
+        target: /app/config.toml
+        read_only: true
+      - type: bind
+        source: ./data
+        target: /app/data
     shm_size: "1gb"
     command:
       - /bin/sh
@@ -26,8 +43,14 @@ services:
           > /tmp/check-submission-status.crontab
         supercronic -test /tmp/check-submission-status.crontab
         /app/.venv/bin/python /app/main.py --config /app/config.toml \
-          || printf '%s\n' 'Initial check failed; scheduled checks will continue.' >&2
-        exec supercronic -split-logs /tmp/check-submission-status.crontab
+          || printf '%s\n' \
+             'Initial check failed; scheduled checks will continue.' >&2
+        exec supercronic \
+          -split-logs \
+          /tmp/check-submission-status.crontab
 
-volumes:
-  submission-data:
+networks:
+  check-submission-status-net:
+    driver: bridge
+
+# use `mkdir data` to create the data directory before running `docker compose up`

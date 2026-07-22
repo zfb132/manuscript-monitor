@@ -7,6 +7,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.28@sha256:0f36cb9361a3346885ca3677e3767016
 ARG TARGETARCH
 ARG SUPERCRONIC_VERSION=v0.2.47
 
+ARG APP_UID=1000
+ARG APP_GID=1000
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
@@ -20,6 +23,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
+        bash \
         ca-certificates \
         chromium \
         chromium-driver \
@@ -37,18 +41,32 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/supercronic; \
     rm -rf /var/lib/apt/lists/*
 
+# 创建与宿主机相同 UID/GID 的 app 用户
+RUN set -eux; \
+    groupadd --gid "${APP_GID}" app; \
+    useradd \
+        --uid "${APP_UID}" \
+        --gid "${APP_GID}" \
+        --create-home \
+        --home-dir /home/app \
+        --shell /bin/bash \
+        --no-log-init \
+        app; \
+    mkdir -p /app /app/data; \
+    chown -R app:app /app /home/app
+
 WORKDIR /app
 
-COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project --no-cache
+# 显式指定复制文件的所有者
+COPY --chown=app:app pyproject.toml uv.lock ./
 
-COPY main.py config.toml ./
+# 从这里开始，构建步骤也以 app 用户运行
+USER app:app
 
-RUN groupadd --system app \
-    && useradd --system --gid app --create-home --home-dir /home/app app \
-    && mkdir -p /app/data \
-    && chown -R app:app /app /home/app
+RUN uv sync --no-dev --no-install-project --no-cache
 
-USER app
+COPY --chown=app:app main.py config.toml ./
+
+RUN mkdir -p /app/data
 
 CMD ["/app/.venv/bin/python", "/app/main.py", "--config", "/app/config.toml"]
