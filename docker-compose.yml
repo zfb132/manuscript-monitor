@@ -10,8 +10,6 @@ services:
           soft: 65536
           hard: 65536
     init: true
-    # 不要再设置 user
-    # Dockerfile 中已经创建了具有正确 UID/GID 的 app 用户
     # user: ${UID}:${GID}
     restart: unless-stopped
     networks:

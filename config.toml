@@ -10,8 +10,17 @@ page_load_timeout_seconds = 60
 # driver_path = "/optional/path/to/chromedriver"
 
 [[accounts]]
-name = "primary"
+name = "tap"
 url = "https://mc.manuscriptcentral.com/tap-ieee"
+username = "${PRIMARY_SCHOLARONE_USERNAME}"
+password = "${PRIMARY_SCHOLARONE_PASSWORD}"
+# An empty list tracks every manuscript. Add short IDs to filter the dashboard.
+manuscript_ids = []
+apprise_urls = ["${PRIMARY_APPRISE_URL}"]
+
+[[accounts]]
+name = "iot"
+url = "https://mc.manuscriptcentral.com/iot"
 username = "${PRIMARY_SCHOLARONE_USERNAME}"
 password = "${PRIMARY_SCHOLARONE_PASSWORD}"
 # An empty list tracks every manuscript. Add short IDs to filter the dashboard.

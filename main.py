@@ -2520,7 +2520,11 @@ def run_once(
         LOGGER.error("Another check is already using the configured database.")
         return 1
     except (OSError, sqlite3.Error, DatabaseError) as exc:
-        LOGGER.exception("The database or process lock operation failed (%s): %s", type(exc).__name__, exc)
+        LOGGER.exception(
+            "The database or process lock operation failed (%s): %s",
+            type(exc).__name__,
+            exc
+        )
         return 1
 
 

@@ -41,7 +41,6 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/supercronic; \
     rm -rf /var/lib/apt/lists/*
 
-# 创建与宿主机相同 UID/GID 的 app 用户
 RUN set -eux; \
     groupadd --gid "${APP_GID}" app; \
     useradd \
@@ -57,10 +56,8 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# 显式指定复制文件的所有者
 COPY --chown=app:app pyproject.toml uv.lock ./
 
-# 从这里开始，构建步骤也以 app 用户运行
 USER app:app
 
 RUN uv sync --no-dev --no-install-project --no-cache
