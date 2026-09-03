@@ -1,60 +1,190 @@
-# Check Submission Status
+<h1 align="center">Check Submission Status</h1>
 
-[Chinese documentation](README_zh.md)
+<p align="center">
+  Monitor multiple ScholarOne accounts, preserve submission history, and get notified when a status changes.
+</p>
 
-## Purpose
+<p align="center">
+  <a href="https://github.com/zfb132/check_submission_status/actions/workflows/ci.yml"><img src="https://github.com/zfb132/check_submission_status/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
+  <a href="Dockerfile"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
+</p>
 
-Check Submission Status signs in to one or more ScholarOne author dashboards, reads the
-current manuscripts, records durable SQLite history, and sends changes through
-[Apprise](https://appriseit.com/getting-started/universal-syntax/). Each valid dashboard row
-provides the normalized short manuscript ID, complete title, displayed submission date and its
-parsed date, and current status.
+<p align="center">
+  <strong>English</strong> · <a href="README_zh.md">Chinese</a>
+</p>
 
-`main.py` performs one check and exits. It is not a daemon and contains no scheduler.
+## Overview
 
-## Behavior
+Check Submission Status signs in to one or more ScholarOne Author Centers during a single run,
+reads each manuscript dashboard, stores durable per-account history in SQLite, and sends changes
+to any destination supported by
+[Apprise](https://appriseit.com/getting-started/universal-syntax/).
 
-Each account has an independent history and at most one complete message per check:
+The application is intentionally simple to operate: `main.py` performs one complete check and
+exits. Run it from your operating system's scheduler, or use Docker Compose for an immediate check
+followed by recurring checks through Supercronic.
 
-- The first successful check for a new or reactivated account is a verification. Every present
-  in-scope manuscript is reported as `CURRENT`; an empty scope still sends a verification message.
-- Later checks report `NEW`, `STATUS_CHANGED`, `DISAPPEARED`, and `REAPPEARED` events. A
-  disappearance is created only after a complete, valid dashboard was parsed and a previously
-  accepted present manuscript is absent.
-- Title-only and submission-date-only changes are stored as the newest complete snapshot but do
-  not notify. A later notifying event uses that updated snapshot.
-- All events for one account are sorted by manuscript ID and aggregated into one untruncated
-  message. Accounts never share a notification.
-- Every configured Apprise destination is attempted independently. If any destination succeeds,
-  the notification and deferred state changes are committed. Failed destinations from that
-  partially successful batch are not retried.
-- If every destination fails, the check is recorded as failed and notification-bearing state is
-  not accepted. The next one-shot invocation regenerates and retries the complete notification.
-- A crash after an external service accepted a message but before SQLite committed it can produce
-  a duplicate on a later run. Delivery is intentionally at least once.
-- Accounts run in configuration order. A capture, parse, or total-delivery failure for one account
-  does not stop later accounts, but the overall process exits nonzero.
+> This is an independent community project and is not affiliated with ScholarOne.
 
-An unchanged non-initial check completes without sending a message.
+## ✨ Features
 
-## Requirements
+- **Automatic monitoring** — signs in with Selenium and reads the ScholarOne author dashboard.
+- **Precise change detection** — reports new, changed, disappeared, and reappeared manuscripts.
+- **Flexible scope** — monitors every manuscript or only selected manuscript IDs.
+- **Multiple ScholarOne accounts** — checks every configured account sequentially while keeping
+  configuration, history, and notifications isolated per account.
+- **Durable history** — records checks, observations, state changes, and delivery results in SQLite.
+- **Universal notifications** — uses Apprise to reach email, chat, push, and many other services.
+- **Failure-safe updates** — advances notification-bearing state only after at least one destination
+  accepts the message.
+- **Two deployment modes** — runs natively on Linux, macOS, and Windows, or in Docker on amd64 and
+  arm64.
 
-- Python 3.14 is preferred; Python 3.10 is the supported floor. See the
-  [official Python downloads](https://www.python.org/downloads/).
-- Google Chrome or Chromium must be installed for native execution.
-- When neither `browser.driver_path` nor `CHROMEDRIVER_PATH` is set, Selenium uses
-  [Selenium Manager](https://www.selenium.dev/documentation/selenium_manager/) to discover or
-  obtain a compatible driver. Its first run can require network access and a writable cache.
-  Offline hosts should install a matching driver and configure it explicitly.
-- Docker deployment requires Docker Engine or Docker Desktop with
-  [Docker Compose](https://docs.docker.com/compose/install/).
+## 🧩 Architecture
 
-## Configuration
+```mermaid
+flowchart LR
+    Scheduler["⏱️ Scheduler<br/>Docker Compose or operating system"] --> App["🐍 main.py<br/>one-shot run"]
+    Config["⚙️ config.toml<br/>account A · account B · ..."] --> App
+    App --> Browser["🌐 Selenium + Chrome<br/>fresh session per account"]
+    Browser --> ScholarOne["ScholarOne Author Centers<br/>account A · account B · ..."]
+    ScholarOne --> Parser["🔎 Parse and validate<br/>complete dashboards"]
+    Parser --> Changes["🔄 Detect changes"]
+    Database[("🗄️ SQLite history")] -->|accepted state| Changes
+    Changes -->|checks and snapshots| Database
+    Changes -->|notifiable events| Apprise["🔔 Apprise"]
+    Apprise --> Destinations["DingTalk · Telegram · Email · Feishu<br/>Discord · WeCom · Slack · ..."]
+```
 
-`--config` defaults to `./config.toml` relative to the current working directory. Paths inside
-that file expand `~`; relative paths are resolved from the configuration file's directory. The
-parser supplies no implicit values for required keys. The tracked file contains useful sample
-values:
+1. Load and reconcile every account from `config.toml`.
+2. Check accounts sequentially, using a fresh browser session for each one.
+3. Parse and validate every row in the complete manuscript dashboard.
+4. Compare each account with its last accepted state in SQLite.
+5. Send one ordered notification per account and commit the new state after delivery succeeds.
+
+A missing or malformed dashboard fails the account check. It is never interpreted as an empty
+dashboard, so a broken login or a ScholarOne layout change cannot silently mark every manuscript
+as disappeared.
+
+## 🚀 Quick start
+
+Clone the repository, then choose the deployment that fits your environment:
+
+```bash
+git clone https://github.com/zfb132/check_submission_status.git
+cd check_submission_status
+```
+
+| | Docker Compose | Native Python |
+| --- | --- | --- |
+| Browser and driver | Included | Install Chrome or Chromium |
+| Scheduling | Included | Use cron, systemd, launchd, or Task Scheduler |
+| Recommended for | Always-on deployment | Local checks and custom automation |
+
+### Docker Compose (recommended)
+
+Docker Engine or Docker Desktop with Compose is required.
+
+```bash
+cp .env.example .env
+mkdir -p data
+```
+
+Edit `config.toml` with your ScholarOne site and account settings, then replace the placeholders in
+`.env`:
+
+```dotenv
+APP_UID=1000
+APP_GID=1000
+CRON_SCHEDULE='0 */6 * * *'
+TZ='UTC'
+PRIMARY_SCHOLARONE_USERNAME='replace-me'
+PRIMARY_SCHOLARONE_PASSWORD='replace-me'
+PRIMARY_APPRISE_URL='replace-me'
+```
+
+Add matching environment variables to `.env` for every additional account referenced by
+`config.toml`.
+
+On Linux, set `APP_UID` and `APP_GID` to the values reported by `id -u` and `id -g` when that user
+is not UID/GID 1000.
+
+Validate the deployment without printing resolved secrets, then start it:
+
+```bash
+docker compose config --quiet
+docker compose up --build -d
+docker compose logs -f checker
+```
+
+The container validates the five-field cron expression, runs one check immediately, and then starts
+the configured schedule. `TZ` controls the schedule timezone; history timestamps remain in UTC.
+
+Useful lifecycle commands:
+
+```bash
+docker compose logs --tail=200 checker
+docker compose restart checker
+docker compose stop checker
+docker compose start checker
+docker compose down
+```
+
+Compose bind-mounts `./data` at `/app/data`. Normal container recreation and
+`docker compose down` both preserve the SQLite history.
+
+### Native Python
+
+Native execution requires Python 3.10 or newer and Google Chrome or Chromium. Python 3.14 is the
+preferred runtime. When no driver path is configured, Selenium Manager discovers or downloads a
+compatible driver; its first run may need network access and a writable cache.
+
+With [uv](https://docs.astral.sh/uv/getting-started/installation/):
+
+```bash
+cp .env.example .env
+# Edit config.toml and .env before continuing.
+uv python install 3.14
+uv sync --locked
+set -a && . ./.env && set +a
+uv run --locked python main.py --config config.toml
+```
+
+The committed lock file makes `uv` the reproducible installation path. Native Python does not load
+`.env` by itself; source it as above or export every variable referenced by `config.toml`. In
+PowerShell, set them with `$env:VARIABLE_NAME = "value"` before running the command.
+
+<details>
+<summary>Install with pip instead</summary>
+
+POSIX shells:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python main.py --config config.toml
+```
+
+Windows PowerShell:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py --config config.toml
+```
+
+</details>
+
+## ⚙️ Configuration
+
+`--config` defaults to `./config.toml`. Relative paths inside the file are resolved from the
+configuration file's directory, and `~` is expanded. The tracked configuration is ready to use as
+a template:
 
 ```toml
 [storage]
@@ -74,372 +204,222 @@ username = "${PRIMARY_SCHOLARONE_USERNAME}"
 password = "${PRIMARY_SCHOLARONE_PASSWORD}"
 manuscript_ids = []
 apprise_urls = ["${PRIMARY_APPRISE_URL}"]
+
+[[accounts]]
+name = "secondary"
+url = "https://mc.manuscriptcentral.com/another-journal"
+username = "${SECONDARY_SCHOLARONE_USERNAME}"
+password = "${SECONDARY_SCHOLARONE_PASSWORD}"
+manuscript_ids = ["ABC-123"]
+apprise_urls = ["${SECONDARY_APPRISE_URL}"]
 ```
 
-The accepted keys are:
+A single invocation checks all configured accounts in the order shown. Repeat `[[accounts]]` as
+needed; every account can use its own site, credentials, manuscript filter, and Apprise
+destinations.
 
-| Key | Required | Meaning |
-| --- | --- | --- |
-| `storage.database_path` | yes | SQLite file. Its parent directory is created automatically. |
-| `browser.headless` | yes | Boolean selecting headless or visible Chrome. |
-| `browser.element_timeout_seconds` | yes | Positive integer wait for login and dashboard elements. |
-| `browser.page_load_timeout_seconds` | yes | Positive integer Selenium page-load timeout. |
-| `browser.binary_path` | no | Explicit Chrome/Chromium executable path. `CHROME_BIN` is the fallback override. |
-| `browser.driver_path` | no | Explicit ChromeDriver path. `CHROMEDRIVER_PATH` is the fallback override. |
-| `accounts[].name` | yes | Unique, case-sensitive, durable account identity. Keep it stable. |
-| `accounts[].url` | yes | ScholarOne login URL using HTTP or HTTPS. |
-| `accounts[].username` | yes | ScholarOne user name. |
-| `accounts[].password` | yes | ScholarOne password. Use an environment reference. |
-| `accounts[].manuscript_ids` | yes | Empty array tracks all dashboard manuscripts; otherwise only normalized listed short IDs are in scope. |
-| `accounts[].apprise_urls` | yes | Nonempty, duplicate-free per-account destination list using [Apprise URL syntax](https://appriseit.com/getting-started/universal-syntax/). |
+| Key | Description |
+| --- | --- |
+| `storage.database_path` | SQLite database path; its parent directory is created automatically. |
+| `browser.headless` | Use headless (`true`) or visible (`false`) Chrome. |
+| `browser.element_timeout_seconds` | Positive wait time for login and dashboard elements. |
+| `browser.page_load_timeout_seconds` | Positive Selenium page-load timeout. |
+| `browser.binary_path` | Optional Chrome/Chromium executable; `CHROME_BIN` is the environment fallback. |
+| `browser.driver_path` | Optional ChromeDriver executable; `CHROMEDRIVER_PATH` is the environment fallback. |
+| `accounts[].name` | Unique, case-sensitive account identity. Keep it stable to preserve history. |
+| `accounts[].url` | ScholarOne login URL using HTTP or HTTPS. |
+| `accounts[].username` | ScholarOne username; environment references are recommended. |
+| `accounts[].password` | ScholarOne password; use an environment reference. |
+| `accounts[].manuscript_ids` | `[]` tracks all manuscripts; otherwise only the listed short IDs are in scope. |
+| `accounts[].apprise_urls` | One or more unique destinations using [Apprise URL syntax](https://appriseit.com/getting-started/universal-syntax/). |
 
-Repeat `[[accounts]]` for multiple accounts. A nonempty ID filter affects notifications and active
-tracking scope, but the complete dashboard must still parse correctly. Removing an ID or account
-closes its active tracking period without deleting history or sending a disappearance. Restoring
-the same account `name` reuses its identity and sends a fresh `CURRENT` verification; renaming an
-account is treated as removal plus a new account.
+`${ENV_VAR}` references are expanded recursively in every configuration string and string-list
+item. Missing variables and expansion cycles are configuration errors.
 
-`${ENV_VAR}` references are recursively expanded in all configuration strings, including list
-entries. An unset variable or expansion cycle is a configuration error. Native Python does not
-read `.env`; export the referenced variables in the invoking shell or scheduler. Docker Compose
-loads the repository `.env` file.
+Removing an account or manuscript filter closes its active tracking period without deleting
+history or sending a disappearance alert. Restoring the same account `name` reuses its identity and
+sends a new initial verification. Renaming an account creates a new identity.
 
-There is deliberately no schedule key in `config.toml`. Native scheduling belongs to the operating
-system, and the Docker schedule belongs to `.env` through `CRON_SCHEDULE`.
+## 🔔 Notifications
 
-## Install with pip
+### Common channels
 
-POSIX shells:
+Apprise supports many notification services. Common choices are listed below; see the
+[official service directory](https://appriseit.com/services/) for complete setup instructions and
+URL syntax.
 
-```bash
-python3.14 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python main.py --config config.toml
-```
+| Channel | Common Apprise scheme |
+| --- | --- |
+| Email | `mailto://`, `mailtos://` |
+| DingTalk | `dingtalk://` |
+| Feishu / Lark | `feishu://`, `lark://` |
+| WeCom Bot | `wecombot://` |
+| ServerChan | `schan://` |
+| PushPlus | `pushplus://` |
+| Bark | `bark://`, `barks://` |
+| PushDeer | `pushdeer://`, `pushdeers://` |
+| WxPusher | `wxpusher://` |
+| Telegram | `tgram://` |
+| Discord | `discord://` |
+| Slack | `slack://` |
+| Microsoft Teams | `workflows://` |
+| WhatsApp | `whatsapp://` |
+| Matrix | `matrix://`, `matrixs://` |
+| ntfy | `ntfy://`, `ntfys://` |
+| Gotify | `gotify://`, `gotifys://` |
+| Pushover | `pover://` |
 
-Windows PowerShell:
+Add one or more URLs to each account's `apprise_urls` list. Accounts can use different channels,
+and all destinations configured for an account are attempted independently.
 
-```powershell
-py -3.14 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe main.py --config config.toml
-```
+### Configuration examples
 
-The final command is one complete check. Export every variable referenced by `config.toml` before
-running it.
-
-## Install with uv
-
-Install uv using its [official installation guide](https://docs.astral.sh/uv/getting-started/installation/),
-then use the committed lock file:
-
-```bash
-uv python install 3.14
-uv sync --locked
-uv run --locked python main.py --config config.toml
-```
-
-`uv sync --locked` refuses to rewrite a stale lock file. The last command remains a one-shot check;
-see the official [locking and syncing guide](https://docs.astral.sh/uv/concepts/projects/sync/).
-
-## Native scheduling
-
-First run the one-shot command manually. Scheduler jobs need absolute paths, network access, write
-access to the database directory, and the same environment variables as the successful manual
-run. Prevent overlapping jobs: one process holds `<database_path>.lock` for its entire invocation,
-and a concurrent process exits immediately with code 1.
-
-The examples run every six hours. Replace the example user and installation paths.
-
-### Linux cron
-
-Create `/home/checker/.config/check-submission-status/env` with shell assignments for the variables
-referenced by `config.toml`, restrict it with `chmod 600`, then edit the `checker` user's crontab:
-
-```bash
-sudo -u checker crontab -e
-```
-
-```cron
-0 */6 * * * set -a && . /home/checker/.config/check-submission-status/env && set +a && cd /home/checker/check-submission-status && /home/checker/check-submission-status/.venv/bin/python /home/checker/check-submission-status/main.py --config /home/checker/check-submission-status/config.toml >> /home/checker/check-submission-status/data/cron.log 2>&1
-```
-
-Cron uses the host's local timezone unless configured otherwise. Consult Cronie's upstream
-[`crontab(5)` source](https://github.com/cronie-crond/cronie/blob/master/man/crontab.5).
-
-### Linux systemd timer
-
-Create a root-readable `/etc/check-submission-status.env`, then create
-`/etc/systemd/system/check-submission-status.service`:
-
-```ini
-[Unit]
-Description=Check ScholarOne submission statuses
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-User=checker
-Group=checker
-WorkingDirectory=/opt/check-submission-status
-EnvironmentFile=/etc/check-submission-status.env
-UMask=0077
-ExecStart=/opt/check-submission-status/.venv/bin/python /opt/check-submission-status/main.py --config /opt/check-submission-status/config.toml
-```
-
-Create `/etc/systemd/system/check-submission-status.timer`:
-
-```ini
-[Unit]
-Description=Run the ScholarOne status check every six hours
-
-[Timer]
-OnCalendar=*-*-* 00,06,12,18:00:00
-Persistent=true
-RandomizedDelaySec=5m
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable and inspect it:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now check-submission-status.timer
-systemctl list-timers check-submission-status.timer
-journalctl -u check-submission-status.service
-```
-
-See the upstream [`systemd.timer` manual](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html).
-
-### macOS launchd
-
-Create a protected `/Users/alice/.config/check-submission-status/env` containing shell assignments.
-Save the following as
-`/Users/alice/Library/LaunchAgents/io.github.check-submission-status.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>io.github.check-submission-status</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string>
-    <string>-c</string>
-    <string>set -a &amp;&amp; source /Users/alice/.config/check-submission-status/env &amp;&amp; set +a &amp;&amp; exec /Users/alice/check-submission-status/.venv/bin/python /Users/alice/check-submission-status/main.py --config /Users/alice/check-submission-status/config.toml</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>/Users/alice/check-submission-status</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StartInterval</key>
-  <integer>21600</integer>
-  <key>StandardOutPath</key>
-  <string>/Users/alice/Library/Logs/check-submission-status.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/alice/Library/Logs/check-submission-status.error.log</string>
-</dict>
-</plist>
-```
-
-Validate, load, test, and inspect the user agent:
-
-```bash
-plutil -lint ~/Library/LaunchAgents/io.github.check-submission-status.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.check-submission-status.plist
-launchctl kickstart -k gui/$(id -u)/io.github.check-submission-status
-launchctl print gui/$(id -u)/io.github.check-submission-status
-```
-
-Use `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.github.check-submission-status.plist`
-before replacing or removing the job. Apple documents periodic jobs in
-[Creating Launch Daemons and Agents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
-
-### Windows Task Scheduler
-
-Set the required variables as protected user environment variables for the task account, then sign
-out and back in so new background processes inherit them. In PowerShell, register a six-hour task
-that directly invokes the one-shot script:
-
-```powershell
-$taskCommand = '"C:\Users\Alice\check-submission-status\.venv\Scripts\python.exe" "C:\Users\Alice\check-submission-status\main.py" --config "C:\Users\Alice\check-submission-status\config.toml"'
-schtasks.exe /Create /TN "Check Submission Status" /TR $taskCommand /SC HOURLY /MO 6 /F
-schtasks.exe /Run /TN "Check Submission Status"
-schtasks.exe /Query /TN "Check Submission Status" /V /FO LIST
-```
-
-Run the task under the same user whose environment and files you configured. Remove it with
-`schtasks.exe /Delete /TN "Check Submission Status" /F`. Microsoft documents all schedule and
-account options in [`schtasks /create`](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create).
-
-## Docker Compose
-
-### Configure and start
-
-Copy the example environment file, then replace every placeholder and choose the cron schedule and
-timezone:
-
-```bash
-cp .env.example .env
-```
-
-```powershell
-Copy-Item .env.example .env
-```
+Keep complete Apprise URLs in environment variables so tokens and passwords do not enter
+`config.toml`. Replace every `{...}` placeholder before use:
 
 ```dotenv
-CRON_SCHEDULE='0 */6 * * *'
-TZ='UTC'
-PRIMARY_SCHOLARONE_USERNAME='replace-me'
-PRIMARY_SCHOLARONE_PASSWORD='replace-me'
-PRIMARY_APPRISE_URL='replace-me'
+# .env
+PRIMARY_WECOM_URL='wecombot://{bot_key}'
+PRIMARY_DINGTALK_URL='dingtalk://{secret}@{token}'
+PRIMARY_FEISHU_URL='feishu://{token}'
+PRIMARY_TELEGRAM_URL='tgram://{bot_token}/{chat_id}'
+PRIMARY_DISCORD_URL='discord://{webhook_id}/{webhook_token}'
+PRIMARY_EMAIL_URL='mailtos://{user}:{app_password}@{domain}'
 ```
 
-Keep secrets in `.env`; keep `${...}` references in `config.toml`. Validate Compose quietly, then
-build and start:
+Reference any combination of them from an account block:
 
-```bash
-docker compose config --quiet
-docker compose up --build -d
-docker compose logs -f checker
+```toml
+# Inside one [[accounts]] block in config.toml
+apprise_urls = [
+  "${PRIMARY_WECOM_URL}",
+  "${PRIMARY_TELEGRAM_URL}",
+  "${PRIMARY_EMAIL_URL}",
+]
 ```
 
-Always include `--quiet` when validating a secret-bearing deployment. Plain `docker compose config`
-renders resolved environment values and can expose secrets in a terminal, log, or support bundle.
-`CRON_SCHEDULE` is mandatory; an unset or empty value makes Compose validation fail.
+Do not commit `.env`. Credentials containing URL-reserved characters must be encoded as required
+by the corresponding Apprise service documentation.
 
-At container startup, Compose validates the generated five-field crontab, performs an immediate
-one-shot check, and then starts Supercronic. A transient failure of the immediate check is logged
-but scheduled checks continue. Invalid cron syntax prevents the scheduler from starting. `TZ`
-controls the cron schedule; application history timestamps remain UTC.
+### Message examples
 
-### Logs and lifecycle
+The line prefixed with `Title:` identifies the separate Apprise title; the remaining lines are its
+body. An initial verification with one manuscript looks like this:
 
-```bash
-docker compose logs --tail=200 checker
-docker compose restart checker
-docker compose stop checker
-docker compose start checker
-docker compose down
+```text
+Submission status verification for primary
+
+Account: primary
+Checked at: 2026-09-01T04:00:00Z
+
+Event: CURRENT
+ID: AP-2026-001
+Title: A Reliable Method for Example Research
+Submitted: 01-Sep-2026
+Status: Awaiting Administrator Processing
 ```
 
-`restart` performs another immediate check before resuming the schedule. `stop` and `down` preserve
-the named data volume. Do not use `docker compose down -v` unless you intend to delete all SQLite
-history. See Docker's official [Compose application model](https://docs.docker.com/compose/intro/compose-application-model/).
+A later check for the same account may report a status change for that manuscript:
 
-## SQLite history, backup, and restore
+```text
+Submission status changes for primary
+Account: primary
+Checked at: 2026-09-03T06:00:23Z
 
-Native runs use `storage.database_path`. Compose mounts the `submission-data` named volume at
-`/app/data`, so the sample database is `/app/data/submissions.db`. Docker owns the volume's physical
-host location; ordinary container replacement does not remove it.
-
-SQLite retains account identities, configuration revisions, filters, checks, tracking periods,
-present and absent observations, accepted current state, complete notification messages, and
-redacted per-destination delivery results. Removing an account or filter closes its active history
-instead of deleting rows. The database stores ScholarOne URLs and usernames as configuration
-history, plus manuscript metadata. It never stores ScholarOne passwords or full Apprise URLs;
-delivery rows keep only destination position, scheme, outcome, timestamp, and fixed safe errors.
-
-The database is not encrypted. Protect it and its backups as sensitive manuscript data.
-
-Stop the checker before backing up. The following POSIX-shell flow writes outside the worktree,
-opens the source database so SQLite can recover any hot rollback journal, uses the
-[SQLite Online Backup API](https://www.sqlite.org/backup.html), and verifies the result:
-
-```bash
-(
-set -eu
-BACKUP_DIR="$HOME/check-submission-status-backups/$(date +%Y%m%d-%H%M%S)"
-BACKUP_CONTAINER="check-submission-status-backup-$(date +%s)"
-mkdir -p "$BACKUP_DIR"
-chmod 700 "$BACKUP_DIR"
-docker compose stop checker
-docker compose run --name "$BACKUP_CONTAINER" --no-deps --entrypoint /app/.venv/bin/python checker -c "import sqlite3, sys; expected={'account_configuration_targets','account_configurations','accounts','checks','current_states','manuscripts','notification_batches','notification_deliveries','observations','tracking_periods'}; source=sqlite3.connect('file:/app/data/submissions.db?mode=rw', uri=True); source_tables={row[0] for row in source.execute(\"SELECT name FROM sqlite_master WHERE type = 'table'\")}; sys.exit('source schema check failed') if source.execute('PRAGMA user_version').fetchone()[0] != 2 or not expected <= source_tables else None; target=sqlite3.connect('/tmp/submissions.db'); source.backup(target); target_tables={row[0] for row in target.execute(\"SELECT name FROM sqlite_master WHERE type = 'table'\")}; valid=target.execute('PRAGMA integrity_check').fetchone()[0] == 'ok' and target.execute('PRAGMA user_version').fetchone()[0] == 2 and expected <= target_tables; target.close(); source.close(); sys.exit('backup integrity or schema check failed') if not valid else None"
-docker cp "$BACKUP_CONTAINER:/tmp/submissions.db" "$BACKUP_DIR/submissions.db"
-docker rm "$BACKUP_CONTAINER"
-chmod 600 "$BACKUP_DIR/submissions.db"
-docker compose start checker
-)
+Event: STATUS_CHANGED
+ID: AP-2026-001
+Title: A Reliable Method for Example Research
+Submitted: 01-Sep-2026
+Previous status: Awaiting TE Recommendation
+Current status: Awaiting EIC Decision
 ```
 
-Keep `BACKUP_DIR` outside the repository and protect it like the live database. If backup creation
-fails, remove the retained `BACKUP_CONTAINER` only after inspecting its logs, and restart the
-checker when it is safe to do so.
+### Notification rules
 
-To restore, select a completed backup, stop the checker, verify the backup read-only, remove the
-old database and every possible SQLite sidecar, copy into the named volume, correct ownership, and
-only then start the checker:
+| Dashboard change | Event | Notification |
+| --- | --- | --- |
+| First successful check or account reactivation | `CURRENT` | Yes, including an empty-scope verification |
+| After initialization, a manuscript appears for the first time | `NEW` | Yes |
+| Status text changes | `STATUS_CHANGED` | Yes, with previous and current status |
+| Previously accepted manuscript is absent from a valid dashboard | `DISAPPEARED` | Yes |
+| Missing manuscript returns | `REAPPEARED` | Yes |
+| Only title or submission date changes | — | Stored without notification |
+| Nothing changes | — | No notification |
 
-```bash
-(
-set -eu
-BACKUP_DIR="$HOME/check-submission-status-backups/20260710-120000"
-docker compose stop checker
-docker compose run --rm --no-deps --user root --entrypoint /app/.venv/bin/python -v "$BACKUP_DIR:/backup:ro" checker -c "import sqlite3, sys; expected={'account_configuration_targets','account_configurations','accounts','checks','current_states','manuscripts','notification_batches','notification_deliveries','observations','tracking_periods'}; database=sqlite3.connect('file:/backup/submissions.db?mode=ro', uri=True); tables={row[0] for row in database.execute(\"SELECT name FROM sqlite_master WHERE type = 'table'\")}; valid=database.execute('PRAGMA integrity_check').fetchone()[0] == 'ok' and database.execute('PRAGMA user_version').fetchone()[0] == 2 and expected <= tables; database.close(); sys.exit('backup integrity or schema check failed') if not valid else None"
-docker compose run --rm --no-deps --user root --entrypoint /bin/rm checker -f /app/data/submissions.db /app/data/submissions.db-journal /app/data/submissions.db-wal /app/data/submissions.db-shm
-docker compose create checker
-docker compose cp "$BACKUP_DIR/submissions.db" checker:/app/data/submissions.db
-docker compose run --rm --no-deps --user root --entrypoint /bin/chown checker app:app /app/data/submissions.db
-docker compose start checker
-)
-```
+Events are sorted by manuscript ID and combined into one untruncated message per account. Every
+configured destination is attempted independently:
 
-The target container may be stopped for `docker compose cp`; see the official
-[`docker compose cp` reference](https://docs.docker.com/reference/cli/docker/compose/cp/). For a
-native deployment, stop scheduled and manual runs and use Python's `sqlite3.Connection.backup`
-instead of copying only the main rollback-journal database file. Verify the backup, preserve its
-permissions, and then restart scheduling.
+- If at least one destination succeeds, the change is committed; failed sibling destinations are
+  not retried.
+- If every destination fails, the accepted state does not advance and the complete message is
+  regenerated on the next run.
+- Delivery is at least once. A crash after an external service accepts a message but before SQLite
+  commits it can produce a duplicate later.
 
-## Troubleshooting and exit codes
+Accounts run in configuration order. Failure in one account does not stop later accounts, but the
+overall process exits with a failure status.
 
-- **Login no longer completes:** run once with `browser.headless = false`. The current ScholarOne
-  flow expects fields named `USERID` and `PASSWORD`, button `#logInButton`, an `Author` navigation
-  link, and table `#authorDashboardQueue`. Site-specific markup changes require selector updates.
-- **Dashboard table is missing or malformed:** the entire account check fails safely; it is never
-  treated as an empty dashboard and accepted state does not advance. Confirm the URL, credentials,
-  author role, and current ScholarOne layout.
-- **Chrome or driver cannot start:** ensure Chrome and ChromeDriver major versions match. Configure
-  `browser.binary_path` and `browser.driver_path`, or set `CHROME_BIN` and `CHROMEDRIVER_PATH`.
-  Remove the overrides to return to Selenium Manager.
-- **Notifications repeat:** if all destinations failed, repetition is expected because state was not
-  committed. Test each Apprise URL. If at least one destination succeeded, the change was committed
-  and failed sibling destinations are not retried.
-- **Lock conflict:** another process is using the same database. Wait for it to exit, inspect the
-  scheduler for overlap, and do not delete the `.lock` file as a substitute for stopping a live
-  process.
-- **Configuration exits before opening Chrome:** all validation errors are reported together. Check
-  unknown or missing keys, path resolution, HTTP(S) account URLs, positive timeouts, duplicate
-  names/destinations, and exported environment variables.
+## ⏱️ Scheduling
 
-Process exit codes:
+`main.py` always performs exactly one check and exits; it does not contain a scheduling loop.
 
-| Code | Meaning |
+- **Docker Compose:** set the required `CRON_SCHEDULE` in `.env` using standard five-field cron
+  syntax.
+- **Native deployment:** schedule the one-shot command with cron, a systemd timer, macOS launchd,
+  or Windows Task Scheduler.
+
+Native jobs should use absolute paths, inherit the same environment variables as a successful
+manual run, and have network and database-directory access. A non-blocking file lock at
+`<database_path>.lock` prevents overlapping checks; a concurrent invocation exits with code 1.
+
+## 🔐 Data and security
+
+- Native runs store history at `storage.database_path`; the sample path is
+  `data/submissions.db`.
+- With the sample configuration, Docker Compose stores the same file under the bind-mounted
+  `./data` directory.
+- SQLite retains account configuration revisions, manuscript metadata, observations, accepted
+  state, notification bodies, and redacted delivery results.
+- Passwords and complete Apprise URLs are never stored in SQLite, but usernames, journal URLs,
+  manuscript details, and notification contents are. The database is not encrypted.
+- Stop scheduled and manual checks before backup or restore, and use SQLite's
+  [Online Backup API](https://www.sqlite.org/backup.html) rather than copying a live database.
+- Never commit `.env`, populated secrets, SQLite files, backups, browser profiles, or logs. Treat
+  Apprise URLs as credentials and restrict environment files and database backups appropriately.
+- Always use `docker compose config --quiet`; the non-quiet form can print resolved secrets.
+
+## 🛠️ Troubleshooting
+
+- **Login does not complete:** temporarily set `browser.headless = false` and run one manual check.
+  Confirm the URL, credentials, author role, and current ScholarOne layout.
+- **Dashboard is missing or malformed:** the account fails safely and accepted state does not
+  advance. ScholarOne selector changes may require a code update.
+- **Chrome or ChromeDriver cannot start:** make sure their major versions match, configure explicit
+  paths, or remove path overrides to return to Selenium Manager.
+- **Notifications repeat:** this is expected after total delivery failure because state was not
+  committed. Test each Apprise URL separately.
+- **Database lock error:** another run is active. Fix overlapping schedules; do not delete the lock
+  file while a process is still running.
+
+| Exit code | Meaning |
 | --- | --- |
-| `0` | Every configured account succeeded, including an empty account list. `--help` also exits 0. |
-| `1` | At least one account, notification, browser, parser, database, or process-lock operation failed. |
+| `0` | Every configured account succeeded; `--help` also exits 0. |
+| `1` | An account, notification, browser, parser, database, or process-lock operation failed. |
 | `2` | Command-line usage or configuration loading/validation failed. |
 
-Docker's Supercronic process remains alive after an individual scheduled check exits 1; inspect the
-service logs for the per-run result.
+## Development
 
-## Security
+```bash
+uv sync --locked
+uv run --locked python -m py_compile main.py
+uv run --locked python -c "import main"
+uv run --locked ruff check main.py
+uv run --locked ruff format --check main.py
+```
 
-- Never commit `.env`, a populated secret-bearing configuration, SQLite data, backups, browser
-  profiles, or logs. The repository ignores `.env`, `/data`, local tests, and demo fixtures.
-- Prefer `${ENV_VAR}` references over literal passwords and Apprise URLs. Restrict environment
-  files to the scheduler account (`chmod 600` on POSIX) and use equivalent Windows ACLs.
-- Treat Apprise URLs as credentials. Do not paste them into issue reports or run unquiet Compose
-  rendering in captured terminals.
-- Restrict the SQLite file even though passwords and full destinations are omitted: it contains
-  usernames, ScholarOne URLs, manuscript titles, statuses, and complete notification bodies.
-- Run native schedulers with an unprivileged dedicated account. The container already runs as the
-  non-root `app` user.
+Issues and pull requests are welcome. Please avoid including credentials, Apprise URLs, or
+manuscript data in reports and fixtures.
 
-For the complete Chinese counterpart, see [README_zh.md](README_zh.md).
+## License
+
+Distributed under the [GNU General Public License v3.0](LICENSE).
