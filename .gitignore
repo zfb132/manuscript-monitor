@@ -169,6 +169,7 @@ cython_debug/
 # Local project state and test fixtures
 /.env
 /.venv/
+/uv.lock
 /data/
 /demo.html
 /tests/

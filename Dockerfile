@@ -1,11 +1,9 @@
-# syntax=docker/dockerfile:1.7
 FROM python:3.14-slim-trixie
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.28@sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa \
+COPY --from=ghcr.io/astral-sh/uv:latest \
     /uv /uvx /bin/
 
 ARG TARGETARCH
-ARG SUPERCRONIC_VERSION=v0.2.47
 
 ARG APP_UID=1000
 ARG APP_GID=1000
@@ -30,14 +28,12 @@ RUN set -eux; \
         curl \
         tzdata; \
     case "${TARGETARCH}" in \
-        amd64) checksum="dcb1403c188a9438c47d4bba82a9c357fc9351ce91627fb2bae627f0f5becfc4" ;; \
-        arm64) checksum="e1124aa34294e2bb8ab7002f347f4363ba35097f3daf4d3c44e9d813c1fb2bb8" ;; \
+        amd64|arm64) ;; \
         *) echo "Unsupported container architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL \
         -o /usr/local/bin/supercronic \
-        "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}"; \
-    echo "${checksum}  /usr/local/bin/supercronic" | sha256sum -c -; \
+        "https://github.com/aptible/supercronic/releases/latest/download/supercronic-linux-${TARGETARCH}"; \
     chmod 0755 /usr/local/bin/supercronic; \
     rm -rf /var/lib/apt/lists/*
 
@@ -56,11 +52,16 @@ RUN set -eux; \
 
 WORKDIR /app
 
-COPY --chown=app:app pyproject.toml uv.lock ./
+COPY --chown=app:app pyproject.toml ./
 
 USER app:app
 
-RUN uv sync --no-dev --no-install-project --no-cache
+RUN uv venv /app/.venv \
+    && uv pip install \
+        --python /app/.venv \
+        --upgrade \
+        --no-cache \
+        --requirements pyproject.toml
 
 COPY --chown=app:app main.py config.toml ./
 

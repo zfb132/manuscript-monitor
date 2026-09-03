@@ -2,6 +2,5 @@
 !Dockerfile
 !.dockerignore
 !pyproject.toml
-!uv.lock
 !main.py
 !config.toml

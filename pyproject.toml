@@ -1,5 +1,5 @@
 [project]
-name = "check-submission-status"
+name = "manuscript-monitor"
 version = "0.1.0"
 description = "Monitor ScholarOne manuscript statuses and send Apprise notifications."
 readme = "README.md"

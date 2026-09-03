@@ -1,5 +1,6 @@
 services:
   checker:
+    image: ghcr.io/zfb132/manuscript-monitor:latest
     build:
       context: .
       args:
@@ -13,7 +14,7 @@ services:
     # user: ${UID}:${GID}
     restart: unless-stopped
     networks:
-      - check-submission-status-net
+      - manuscript-monitor-net
     env_file:
       - .env
     environment:
@@ -38,17 +39,17 @@ services:
         printf '%s %s\n' \
           "$${CRON_SCHEDULE}" \
           '/app/.venv/bin/python /app/main.py --config /app/config.toml' \
-          > /tmp/check-submission-status.crontab
-        supercronic -test /tmp/check-submission-status.crontab
+          > /tmp/manuscript-monitor.crontab
+        supercronic -test /tmp/manuscript-monitor.crontab
         /app/.venv/bin/python /app/main.py --config /app/config.toml \
           || printf '%s\n' \
              'Initial check failed; scheduled checks will continue.' >&2
         exec supercronic \
           -split-logs \
-          /tmp/check-submission-status.crontab
+          /tmp/manuscript-monitor.crontab
 
 networks:
-  check-submission-status-net:
+  manuscript-monitor-net:
     driver: bridge
 
 # use `mkdir data` to create the data directory before running `docker compose up`

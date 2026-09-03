@@ -1,11 +1,11 @@
-<h1 align="center">Check Submission Status</h1>
+<h1 align="center">Manuscript Monitor</h1>
 
 <p align="center">
   同时监控多个 ScholarOne 账户，持续保存投稿历史，并在状态变化时及时接收通知。
 </p>
 
 <p align="center">
-  <a href="https://github.com/zfb132/check_submission_status/actions/workflows/ci.yml"><img src="https://github.com/zfb132/check_submission_status/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/zfb132/manuscript-monitor/actions/workflows/ci.yml"><img src="https://github.com/zfb132/manuscript-monitor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
   <a href="Dockerfile"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
@@ -17,7 +17,7 @@
 
 ## 项目简介
 
-Check Submission Status 会在单次运行中依次登录一个或多个 ScholarOne 作者中心，读取每个
+Manuscript Monitor 会在单次运行中依次登录一个或多个 ScholarOne 作者中心，读取每个
 账户的稿件列表，将各账户历史分别持久化到 SQLite，并通过
 [Apprise](https://appriseit.com/getting-started/universal-syntax/) 向任意受支持的目标发送
 变更通知。
@@ -71,8 +71,8 @@ ScholarOne 页面结构变化不会悄悄把所有稿件标记为消失。
 先克隆仓库，再根据运行环境选择部署方式：
 
 ```bash
-git clone https://github.com/zfb132/check_submission_status.git
-cd check_submission_status
+git clone https://github.com/zfb132/manuscript-monitor.git
+cd manuscript-monitor
 ```
 
 | | Docker Compose | 原生 Python |
@@ -104,16 +104,23 @@ PRIMARY_APPRISE_URL='replace-me'
 
 请在 `.env` 中加入 `config.toml` 里每个新增账户所引用的对应环境变量。
 
-在 Linux 上，如果当前用户的 UID/GID 不是 1000，请将 `APP_UID` 和 `APP_GID` 分别设置为
-`id -u` 和 `id -g` 的输出。
+发布镜像以 UID/GID 1000 运行。在 Linux 上，如果当前用户的 ID 不同，请将 `APP_UID` 和
+`APP_GID` 分别设为 `id -u` 和 `id -g` 的输出，然后使用
+`docker compose up --build -d`；这些变量只影响本地构建。
 
 先在不输出已解析秘密的情况下验证部署，再启动服务：
 
 ```bash
 docker compose config --quiet
-docker compose up --build -d
+docker compose up -d
 docker compose logs -f checker
 ```
+
+Compose 默认拉取 `ghcr.io/zfb132/manuscript-monitor:latest`。也可添加 `--build`，使用当前源码
+在本地构建。
+新建的 GHCR 软件包默认为私有，因此首次发布后，维护者需要
+[将软件包设为公开](https://docs.github.com/zh/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
+才能允许匿名拉取；否则请先运行 `docker login ghcr.io`。
 
 容器会验证五字段 cron 表达式，立即执行一次检查，然后启动设定的定时任务。`TZ` 控制
 调度时区；历史记录的时间戳始终使用 UTC。
@@ -143,13 +150,14 @@ Python 3.14。未配置驱动路径时，Selenium Manager 会查找或下载兼�
 cp .env.example .env
 # 继续前请先编辑 config.toml 和 .env。
 uv python install 3.14
-uv sync --locked
+uv venv --python 3.14 --no-project
+uv pip install --python .venv --upgrade --requirements pyproject.toml
 set -a && . ./.env && set +a
-uv run --locked python main.py --config config.toml
+uv run --no-project python main.py --config config.toml
 ```
 
-提交到仓库的锁文件使 uv 成为可复现的安装方式。原生 Python 不会自动加载 `.env`；请像
-上面一样导入它，或导出 `config.toml` 引用的全部变量。在 PowerShell 中，可先通过
+安装时会把依赖解析为最新的兼容版本。原生 Python 不会自动加载 `.env`；请像上面一样导入
+它，或导出 `config.toml` 引用的全部变量。在 PowerShell 中，可先通过
 `$env:VARIABLE_NAME = "value"` 设置变量。
 
 <details>
@@ -395,11 +403,12 @@ Current status: Awaiting EIC Decision
 ## 开发
 
 ```bash
-uv sync --locked
-uv run --locked python -m py_compile main.py
-uv run --locked python -c "import main"
-uv run --locked ruff check main.py
-uv run --locked ruff format --check main.py
+uv venv --python 3.14 --no-project
+uv pip install --python .venv --upgrade --requirements pyproject.toml --group dev
+uv run --no-project python -m py_compile main.py
+uv run --no-project python -c "import main"
+uv run --no-project ruff check main.py
+uv run --no-project ruff format --check main.py
 ```
 
 欢迎提交 Issue 和 Pull Request。请勿在问题报告或测试夹具中包含凭据、Apprise URL 或稿件

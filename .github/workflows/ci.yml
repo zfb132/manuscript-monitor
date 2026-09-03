@@ -16,31 +16,31 @@ jobs:
         python-version: ["3.10", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.11.28"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      - run: uv sync --locked
-      - run: uv run --locked python -m py_compile main.py
-      - run: uv run --locked python -c "import main"
-      - run: uv run --locked python main.py --help
-      - run: uv run --locked ruff check main.py
-      - run: uv run --locked ruff format --check main.py
+      - run: uv venv --python "${{ matrix.python-version }}" --no-project
+      - run: uv pip install --python .venv --upgrade --requirements pyproject.toml --group dev
+      - run: uv run --no-project python -m py_compile main.py
+      - run: uv run --no-project python -c "import main"
+      - run: uv run --no-project python main.py --help
+      - run: uv run --no-project ruff check main.py
+      - run: uv run --no-project ruff format --check main.py
 
   repository-policy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
-          version: "0.11.28"
           python-version: "3.14"
-      - run: uv sync --locked
+      - run: uv venv --python "3.14" --no-project
+      - run: uv pip install --python .venv --upgrade --requirements pyproject.toml --group dev
       - name: Verify tracked Python and language policy
         run: >-
-          uv run --locked python -c "import pathlib,re,subprocess,sys;
+          uv run --no-project python -c "import pathlib,re,subprocess,sys;
           files=subprocess.check_output(['git','ls-files'],text=True).splitlines();
           py=[item for item in files if item.endswith('.py')];
           han=re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U000323af]');
@@ -50,6 +50,8 @@ jobs:
           sys.exit(0 if py == ['main.py'] and not bad else 1)"
 
   docker-smoke:
+    env:
+      IMAGE_NAME: ${{ github.event.repository.name }}
     strategy:
       fail-fast: false
       matrix:
@@ -60,11 +62,11 @@ jobs:
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@v7.0.1
       - run: cp .env.example .env
       - run: docker compose config --quiet
-      - run: docker build --platform "${{ matrix.platform }}" --tag check-submission-status:ci .
+      - run: docker build --pull --platform "${{ matrix.platform }}" --tag "${IMAGE_NAME}:ci" .
       - run: >-
-          docker run --rm --entrypoint /bin/sh check-submission-status:ci
+          docker run --rm --entrypoint /bin/sh "${IMAGE_NAME}:ci"
           -c 'test "$(id -u)" -ne 0 && chromium --version && chromedriver --version
           && python -c "import apprise, bs4, filelock, selenium"'

@@ -1,11 +1,11 @@
-<h1 align="center">Check Submission Status</h1>
+<h1 align="center">Manuscript Monitor</h1>
 
 <p align="center">
   Monitor multiple ScholarOne accounts, preserve submission history, and get notified when a status changes.
 </p>
 
 <p align="center">
-  <a href="https://github.com/zfb132/check_submission_status/actions/workflows/ci.yml"><img src="https://github.com/zfb132/check_submission_status/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/zfb132/manuscript-monitor/actions/workflows/ci.yml"><img src="https://github.com/zfb132/manuscript-monitor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
   <a href="Dockerfile"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"></a>
@@ -17,7 +17,7 @@
 
 ## Overview
 
-Check Submission Status signs in to one or more ScholarOne Author Centers during a single run,
+Manuscript Monitor signs in to one or more ScholarOne Author Centers during a single run,
 reads each manuscript dashboard, stores durable per-account history in SQLite, and sends changes
 to any destination supported by
 [Apprise](https://appriseit.com/getting-started/universal-syntax/).
@@ -73,8 +73,8 @@ as disappeared.
 Clone the repository, then choose the deployment that fits your environment:
 
 ```bash
-git clone https://github.com/zfb132/check_submission_status.git
-cd check_submission_status
+git clone https://github.com/zfb132/manuscript-monitor.git
+cd manuscript-monitor
 ```
 
 | | Docker Compose | Native Python |
@@ -108,16 +108,23 @@ PRIMARY_APPRISE_URL='replace-me'
 Add matching environment variables to `.env` for every additional account referenced by
 `config.toml`.
 
-On Linux, set `APP_UID` and `APP_GID` to the values reported by `id -u` and `id -g` when that user
-is not UID/GID 1000.
+The published image runs as UID/GID 1000. On Linux, if your user has different IDs, set `APP_UID`
+and `APP_GID` to the values reported by `id -u` and `id -g`, then use `docker compose up --build -d`;
+these variables affect local builds only.
 
 Validate the deployment without printing resolved secrets, then start it:
 
 ```bash
 docker compose config --quiet
-docker compose up --build -d
+docker compose up -d
 docker compose logs -f checker
 ```
+
+Compose pulls `ghcr.io/zfb132/manuscript-monitor:latest` by default. Add `--build` to build the
+current source tree locally. New GHCR packages are private by default, so after the first publish a
+maintainer must
+[make the package public](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
+for anonymous pulls; otherwise sign in with `docker login ghcr.io` first.
 
 The container validates the five-field cron expression, runs one check immediately, and then starts
 the configured schedule. `TZ` controls the schedule timezone; history timestamps remain in UTC.
@@ -147,14 +154,16 @@ With [uv](https://docs.astral.sh/uv/getting-started/installation/):
 cp .env.example .env
 # Edit config.toml and .env before continuing.
 uv python install 3.14
-uv sync --locked
+uv venv --python 3.14 --no-project
+uv pip install --python .venv --upgrade --requirements pyproject.toml
 set -a && . ./.env && set +a
-uv run --locked python main.py --config config.toml
+uv run --no-project python main.py --config config.toml
 ```
 
-The committed lock file makes `uv` the reproducible installation path. Native Python does not load
-`.env` by itself; source it as above or export every variable referenced by `config.toml`. In
-PowerShell, set them with `$env:VARIABLE_NAME = "value"` before running the command.
+Dependencies are resolved to their newest compatible releases when they are installed. Native
+Python does not load `.env` by itself; source it as above or export every variable referenced by
+`config.toml`. In PowerShell, set them with `$env:VARIABLE_NAME = "value"` before running the
+command.
 
 <details>
 <summary>Install with pip instead</summary>
@@ -410,11 +419,12 @@ manual run, and have network and database-directory access. A non-blocking file 
 ## Development
 
 ```bash
-uv sync --locked
-uv run --locked python -m py_compile main.py
-uv run --locked python -c "import main"
-uv run --locked ruff check main.py
-uv run --locked ruff format --check main.py
+uv venv --python 3.14 --no-project
+uv pip install --python .venv --upgrade --requirements pyproject.toml --group dev
+uv run --no-project python -m py_compile main.py
+uv run --no-project python -c "import main"
+uv run --no-project ruff check main.py
+uv run --no-project ruff format --check main.py
 ```
 
 Issues and pull requests are welcome. Please avoid including credentials, Apprise URLs, or
