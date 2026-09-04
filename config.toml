@@ -1,3 +1,6 @@
+# Every run waits for a random duration from zero through this value.
+jitter_seconds = 30
+
 [storage]
 # Relative paths are resolved from this file's directory.
 database_path = "data/submissions.db"
@@ -12,17 +15,17 @@ page_load_timeout_seconds = 60
 [[accounts]]
 name = "tap"
 url = "https://mc.manuscriptcentral.com/tap-ieee"
-username = "${PRIMARY_SCHOLARONE_USERNAME}"
-password = "${PRIMARY_SCHOLARONE_PASSWORD}"
+username = "${IEEE_TAP_SCHOLARONE_USERNAME}"
+password = "${IEEE_TAP_SCHOLARONE_PASSWORD}"
 # An empty list tracks every manuscript. Add short IDs to filter the dashboard.
 manuscript_ids = []
-apprise_urls = ["${PRIMARY_APPRISE_URL}"]
+apprise_urls = ["${IEEE_TAP_APPRISE_URL}"]
 
 [[accounts]]
 name = "iot"
 url = "https://mc.manuscriptcentral.com/iot"
-username = "${PRIMARY_SCHOLARONE_USERNAME}"
-password = "${PRIMARY_SCHOLARONE_PASSWORD}"
+username = "${IEEE_IOT_SCHOLARONE_USERNAME}"
+password = "${IEEE_IOT_SCHOLARONE_PASSWORD}"
 # An empty list tracks every manuscript. Add short IDs to filter the dashboard.
 manuscript_ids = []
-apprise_urls = ["${PRIMARY_APPRISE_URL}"]
+apprise_urls = ["${IEEE_IOT_APPRISE_URL}"]

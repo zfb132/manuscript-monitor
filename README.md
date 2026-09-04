@@ -22,8 +22,8 @@ reads each manuscript dashboard, stores durable per-account history in SQLite, a
 to any destination supported by
 [Apprise](https://appriseit.com/getting-started/universal-syntax/).
 
-The application is intentionally simple to operate: `main.py` performs one complete check and
-exits. Run it from your operating system's scheduler, or use Docker Compose for an immediate check
+The application can be run as a single file: `main.py` performs one complete check and
+exits. Run it from your operating system's scheduler, or use Docker Compose for a startup check
 followed by recurring checks through Supercronic.
 
 > This is an independent community project and is not affiliated with ScholarOne.
@@ -98,11 +98,15 @@ Edit `config.toml` with your ScholarOne site and account settings, then replace 
 ```dotenv
 APP_UID=1000
 APP_GID=1000
+# https://crontab.cronhub.io/
 CRON_SCHEDULE='0 */6 * * *'
 TZ='UTC'
-PRIMARY_SCHOLARONE_USERNAME='replace-me'
-PRIMARY_SCHOLARONE_PASSWORD='replace-me'
-PRIMARY_APPRISE_URL='replace-me'
+IEEE_TAP_SCHOLARONE_USERNAME='replace-me'
+IEEE_TAP_SCHOLARONE_PASSWORD='replace-me'
+IEEE_TAP_APPRISE_URL='replace-me'
+IEEE_IOT_SCHOLARONE_USERNAME='replace-me'
+IEEE_IOT_SCHOLARONE_PASSWORD='replace-me'
+IEEE_IOT_APPRISE_URL='replace-me'
 ```
 
 Add matching environment variables to `.env` for every additional account referenced by
@@ -112,22 +116,18 @@ The published image runs as UID/GID 1000. On Linux, if your user has different I
 and `APP_GID` to the values reported by `id -u` and `id -g`, then use `docker compose up --build -d`;
 these variables affect local builds only.
 
-Validate the deployment without printing resolved secrets, then start it:
+Run the dockerized service:
 
 ```bash
-docker compose config --quiet
 docker compose up -d
 docker compose logs -f checker
 ```
 
-Compose pulls `ghcr.io/zfb132/manuscript-monitor:latest` by default. Add `--build` to build the
-current source tree locally. New GHCR packages are private by default, so after the first publish a
-maintainer must
-[make the package public](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
-for anonymous pulls; otherwise sign in with `docker login ghcr.io` first.
+Compose pulls `ghcr.io/zfb132/manuscript-monitor:latest` by default.
 
-The container validates the five-field cron expression, runs one check immediately, and then starts
-the configured schedule. `TZ` controls the schedule timezone; history timestamps remain in UTC.
+The container validates the five-field cron expression, runs one startup check, and then starts the
+configured schedule. Every invocation waits for the random delay configured by `jitter_seconds`
+before checking. `TZ` controls the schedule timezone; history timestamps remain in UTC.
 
 Useful lifecycle commands:
 
@@ -196,6 +196,8 @@ configuration file's directory, and `~` is expanded. The tracked configuration i
 a template:
 
 ```toml
+jitter_seconds = 30
+
 [storage]
 database_path = "data/submissions.db"
 
@@ -229,6 +231,7 @@ destinations.
 
 | Key | Description |
 | --- | --- |
+| `jitter_seconds` | Maximum random delay before every check, in seconds. Defaults to `30`; use `0` to disable it. |
 | `storage.database_path` | SQLite database path; its parent directory is created automatically. |
 | `browser.headless` | Use headless (`true`) or visible (`false`) Chrome. |
 | `browser.element_timeout_seconds` | Positive wait time for login and dashboard elements. |
@@ -307,13 +310,9 @@ apprise_urls = [
 ]
 ```
 
-Do not commit `.env`. Credentials containing URL-reserved characters must be encoded as required
-by the corresponding Apprise service documentation.
-
 ### Message examples
 
-The line prefixed with `Title:` identifies the separate Apprise title; the remaining lines are its
-body. An initial verification with one manuscript looks like this:
+An initial verification with one manuscript looks like this:
 
 ```text
 Submission status verification for primary
@@ -371,6 +370,7 @@ overall process exits with a failure status.
 ## ⏱️ Scheduling
 
 `main.py` always performs exactly one check and exits; it does not contain a scheduling loop.
+Before each check, it waits for a random duration from zero through `jitter_seconds`.
 
 - **Docker Compose:** set the required `CRON_SCHEDULE` in `.env` using standard five-field cron
   syntax.
@@ -379,7 +379,12 @@ overall process exits with a failure status.
 
 Native jobs should use absolute paths, inherit the same environment variables as a successful
 manual run, and have network and database-directory access. A non-blocking file lock at
-`<database_path>.lock` prevents overlapping checks; a concurrent invocation exits with code 1.
+`<database_path>.lock` prevents overlapping checks. After its jitter delay, an invocation exits
+with code 1 if another check still holds the lock.
+
+Runtime logs identify each checked account and manuscript, show previous and current statuses,
+report notification delivery by destination scheme, and finish with a per-account outcome summary.
+Passwords and complete Apprise URLs are not logged.
 
 ## 🔐 Data and security
 
@@ -393,8 +398,6 @@ manual run, and have network and database-directory access. A non-blocking file 
   manuscript details, and notification contents are. The database is not encrypted.
 - Stop scheduled and manual checks before backup or restore, and use SQLite's
   [Online Backup API](https://www.sqlite.org/backup.html) rather than copying a live database.
-- Never commit `.env`, populated secrets, SQLite files, backups, browser profiles, or logs. Treat
-  Apprise URLs as credentials and restrict environment files and database backups appropriately.
 - Always use `docker compose config --quiet`; the non-quiet form can print resolved secrets.
 
 ## 🛠️ Troubleshooting

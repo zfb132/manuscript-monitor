@@ -22,8 +22,8 @@ Manuscript Monitor 会在单次运行中依次登录一个或多个 ScholarOne �
 [Apprise](https://appriseit.com/getting-started/universal-syntax/) 向任意受支持的目标发送
 变更通知。
 
-项目的运行方式有意保持简单：`main.py` 每次完成一次检查后退出。你可以交给操作系统的
-任务调度器定期执行，也可以使用 Docker Compose 在启动时立即检查，并通过 Supercronic
+项目支持单文件运行：`main.py` 每次完成一次检查后退出。你可以交给操作系统的
+任务调度器定期执行，也可以使用 Docker Compose 在启动时检查，并通过 Supercronic
 继续定时检查。
 
 > 本项目是独立的社区项目，与 ScholarOne 官方无关。
@@ -95,11 +95,15 @@ mkdir -p data
 ```dotenv
 APP_UID=1000
 APP_GID=1000
+# https://crontab.cronhub.io/
 CRON_SCHEDULE='0 */6 * * *'
 TZ='UTC'
-PRIMARY_SCHOLARONE_USERNAME='replace-me'
-PRIMARY_SCHOLARONE_PASSWORD='replace-me'
-PRIMARY_APPRISE_URL='replace-me'
+IEEE_TAP_SCHOLARONE_USERNAME='replace-me'
+IEEE_TAP_SCHOLARONE_PASSWORD='replace-me'
+IEEE_TAP_APPRISE_URL='replace-me'
+IEEE_IOT_SCHOLARONE_USERNAME='replace-me'
+IEEE_IOT_SCHOLARONE_PASSWORD='replace-me'
+IEEE_IOT_APPRISE_URL='replace-me'
 ```
 
 请在 `.env` 中加入 `config.toml` 里每个新增账户所引用的对应环境变量。
@@ -108,22 +112,18 @@ PRIMARY_APPRISE_URL='replace-me'
 `APP_GID` 分别设为 `id -u` 和 `id -g` 的输出，然后使用
 `docker compose up --build -d`；这些变量只影响本地构建。
 
-先在不输出已解析秘密的情况下验证部署，再启动服务：
+启动服务：
 
 ```bash
-docker compose config --quiet
 docker compose up -d
 docker compose logs -f checker
 ```
 
-Compose 默认拉取 `ghcr.io/zfb132/manuscript-monitor:latest`。也可添加 `--build`，使用当前源码
-在本地构建。
-新建的 GHCR 软件包默认为私有，因此首次发布后，维护者需要
-[将软件包设为公开](https://docs.github.com/zh/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)
-才能允许匿名拉取；否则请先运行 `docker login ghcr.io`。
+Compose 默认拉取 `ghcr.io/zfb132/manuscript-monitor:latest`。
 
-容器会验证五字段 cron 表达式，立即执行一次检查，然后启动设定的定时任务。`TZ` 控制
-调度时区；历史记录的时间戳始终使用 UTC。
+容器会验证五字段 cron 表达式，执行一次启动检查，然后启动设定的定时任务。每次调用都会
+先按 `jitter_seconds` 设置随机等待，再开始检查。`TZ` 控制调度时区；历史记录的时间戳
+始终使用 UTC。
 
 常用生命周期命令：
 
@@ -190,6 +190,8 @@ py -3.14 -m venv .venv
 展开 `~`。仓库中的配置文件可直接作为模板：
 
 ```toml
+jitter_seconds = 30
+
 [storage]
 database_path = "data/submissions.db"
 
@@ -222,6 +224,7 @@ apprise_urls = ["${SECONDARY_APPRISE_URL}"]
 
 | 配置项 | 说明 |
 | --- | --- |
+| `jitter_seconds` | 每次检查前随机等待的最大秒数；默认 `30`，设为 `0` 可关闭。 |
 | `storage.database_path` | SQLite 数据库路径；程序会自动创建父目录。 |
 | `browser.headless` | 使用无头（`true`）或可见（`false`）Chrome。 |
 | `browser.element_timeout_seconds` | 等待登录和控制台元素的正数秒数。 |
@@ -298,12 +301,9 @@ apprise_urls = [
 ]
 ```
 
-不要提交 `.env`。凭据中如有 URL 保留字符，应按照对应 Apprise 服务文档进行编码。
-
 ### 消息示例
 
-以下示例中以 `Title:` 开头的行标识独立的 Apprise 标题，其余内容为正文。包含一篇稿件的
-首次验证如下：
+包含一篇稿件的首次验证示例如下：
 
 ```text
 Submission status verification for primary
@@ -357,6 +357,7 @@ Current status: Awaiting EIC Decision
 ## ⏱️ 定时运行
 
 `main.py` 每次始终只执行一次检查后退出，不包含内部调度循环。
+每次检查前，程序会在零到 `jitter_seconds` 秒之间随机等待。
 
 - **Docker Compose：** 在 `.env` 中通过标准五字段 cron 语法设置必填的
   `CRON_SCHEDULE`。
@@ -364,8 +365,11 @@ Current status: Awaiting EIC Decision
   调用单次运行命令。
 
 原生任务应使用绝对路径，继承与成功手动运行相同的环境变量，并拥有网络和数据库目录访问
-权限。程序会在整个运行期间持有非阻塞的 `<database_path>.lock` 文件锁，重叠运行会立即
-以代码 1 退出。
+权限。程序会在整个运行期间持有非阻塞的 `<database_path>.lock` 文件锁；随机等待结束后，
+若另一个检查仍持有该锁，本次调用会以代码 1 退出。
+
+运行日志会列出所检查的账户和稿件，显示之前与当前状态、各通知协议的投递结果，以及最终
+的账户成功/失败汇总；不会输出密码或完整的 Apprise URL。
 
 ## 🔐 数据与安全
 
@@ -378,8 +382,6 @@ Current status: Awaiting EIC Decision
   内容；数据库本身没有加密。
 - 备份或恢复前应停止全部计划任务和手动检查，并使用 SQLite
   [在线备份 API](https://www.sqlite.org/backup.html)，不要直接复制正在使用的数据库。
-- 绝不要提交 `.env`、已填入秘密的配置、SQLite 文件、备份、浏览器配置文件或日志。应将
-  Apprise URL 视为凭据，并妥善限制环境文件和数据库备份的访问权限。
 - 始终使用 `docker compose config --quiet`；非静默形式可能输出解析后的秘密。
 
 ## 🛠️ 故障排查

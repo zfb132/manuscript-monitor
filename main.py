@@ -1,8 +1,10 @@
 import argparse
 import logging
 import os
+import random
 import re
 import sqlite3
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
@@ -33,6 +35,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 LOGGER = logging.getLogger(__name__)
 
+DEFAULT_JITTER_SECONDS = 30
 ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 MAX_ENVIRONMENT_SUBSTITUTIONS = 4096
 MAX_ENVIRONMENT_OUTPUT_CHARS = 1024 * 1024
@@ -242,7 +245,7 @@ ALLOWED_DELIVERY_FAILURES = frozenset(
     }
 )
 
-ROOT_KEYS = frozenset({"storage", "browser", "accounts"})
+ROOT_KEYS = frozenset({"jitter_seconds", "storage", "browser", "accounts"})
 STORAGE_KEYS = frozenset({"database_path"})
 BROWSER_KEYS = frozenset(
     {
@@ -553,6 +556,7 @@ class AppConfig:
     storage: StorageConfig
     browser: BrowserConfig
     accounts: tuple[AccountConfig, ...]
+    jitter_seconds: int = DEFAULT_JITTER_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,6 +596,15 @@ class ManuscriptEvent:
         if snapshot is None:
             raise RuntimeError("A manuscript event requires a snapshot.")
         return snapshot.external_id
+
+
+@dataclass(frozen=True, slots=True)
+class ManuscriptStateComparison:
+    external_id: str
+    result: str
+    previous_status: str | None
+    current_status: str | None
+    previous_observed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,6 +657,7 @@ class PreparedCheck:
     batch: StoredNotificationBatch | None
     deferred_updates: tuple[ProjectionUpdate, ...]
     clear_initial_on_commit: bool
+    state_comparisons: tuple[ManuscriptStateComparison, ...] = ()
 
 
 def calculate_events(
@@ -682,6 +696,59 @@ def calculate_events(
             )
         )
     return tuple(events)
+
+
+def build_manuscript_state_comparisons(
+    external_ids: Iterable[str],
+    current: Mapping[str, ManuscriptSnapshot],
+    accepted: Mapping[str, AcceptedState],
+    events: Sequence[ManuscriptEvent],
+) -> tuple[ManuscriptStateComparison, ...]:
+    events_by_id = {event.external_id: event for event in events}
+    comparisons: list[ManuscriptStateComparison] = []
+    for external_id in sorted(set(external_ids)):
+        snapshot = current.get(external_id)
+        previous = accepted.get(external_id)
+        event = events_by_id.get(external_id)
+        if event is not None:
+            result = event.kind.value
+        elif previous is None and snapshot is None:
+            result = "UNOBSERVED"
+        else:
+            result = "UNCHANGED"
+        comparisons.append(
+            ManuscriptStateComparison(
+                external_id=external_id,
+                result=result,
+                previous_status=(
+                    previous.snapshot.status
+                    if previous is not None and previous.snapshot is not None
+                    else None
+                ),
+                current_status=snapshot.status if snapshot is not None else None,
+                previous_observed=previous is not None,
+            )
+        )
+    return tuple(comparisons)
+
+
+def log_manuscript_states(
+    account_name: str,
+    comparisons: Sequence[ManuscriptStateComparison],
+) -> None:
+    for comparison in comparisons:
+        previous_status = comparison.previous_status
+        if previous_status is None:
+            previous_status = "<absent>" if comparison.previous_observed else "<not observed>"
+        current_status = comparison.current_status or "<absent>"
+        LOGGER.info(
+            "Manuscript state account=%r id=%r result=%s previous=%r current=%r",
+            account_name,
+            comparison.external_id,
+            comparison.result,
+            previous_status,
+            current_status,
+        )
 
 
 def _notification_event_lines(event: ManuscriptEvent) -> list[str]:
@@ -754,7 +821,12 @@ def redact_exception(
     exc: BaseException,
     secrets: Iterable[str] = (),
 ) -> RedactedError:
-    del exc, secrets
+    if isinstance(exc, (BrowserCaptureError, DashboardParseError)):
+        message = str(exc)
+        for secret in secrets:
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        return RedactedError(type(exc).__name__, message)
     return RedactedError(
         SUPPRESSED_OPERATION_ERROR_TYPE,
         SUPPRESSED_OPERATION_ERROR_MESSAGE,
@@ -1314,6 +1386,12 @@ def prepare_check(
             accepted,
             initial_verification=account.needs_initial_notification,
         )
+        state_comparisons = build_manuscript_state_comparisons(
+            (str(row["external_id"]) for row in period_rows),
+            current,
+            accepted,
+            events,
+        )
         event_ids = {event.external_id for event in events}
         deferred_updates: list[ProjectionUpdate] = []
         for external_id, update in observation_updates.items():
@@ -1367,6 +1445,7 @@ def prepare_check(
         batch=batch,
         deferred_updates=tuple(deferred_updates),
         clear_initial_on_commit=account.needs_initial_notification,
+        state_comparisons=state_comparisons,
     )
 
 
@@ -1819,17 +1898,26 @@ def capture_dashboard_html(
     wait_factory: Callable[[Any, int], Any] = WebDriverWait,
 ) -> str:
     driver: Any | None = None
+    stage = "starting browser"
     try:
         driver = driver_factory(browser, environ)
+        stage = "loading login page"
         driver.get(account.url)
+        stage = "creating browser wait"
         wait = wait_factory(driver, browser.element_timeout_seconds)
+        stage = "locating username"
         username = wait.until(EC.presence_of_element_located((By.NAME, "USERID")))
+        stage = "entering username"
         username.clear()
         username.send_keys(account.username)
+        stage = "locating password"
         password = wait.until(EC.presence_of_element_located((By.NAME, "PASSWORD")))
+        stage = "entering password"
         password.clear()
         password.send_keys(account.password)
+        stage = "locating login button"
         login = wait.until(EC.element_to_be_clickable((By.ID, "logInButton")))
+        stage = "submitting login"
         driver.execute_script("arguments[0].click();", login)
 
         def find_author(current_driver: Any) -> Any:
@@ -1838,25 +1926,33 @@ def capture_dashboard_html(
                     return link
             return False
 
+        stage = "locating author center"
         author = wait.until(find_author)
+        stage = "opening author center"
         href = author.get_attribute("href") or ""
         if href.lower().startswith("javascript:"):
             driver.execute_script(href.split(":", 1)[1])
         else:
             author.click()
+        stage = "locating dashboard"
         wait.until(EC.presence_of_element_located((By.ID, "authorDashboardQueue")))
+        stage = "configuring dashboard capture"
         if hasattr(driver, "set_script_timeout"):
             driver.set_script_timeout(browser.element_timeout_seconds + 1)
+        stage = "capturing dashboard"
         payload = driver.execute_async_script(
             DASHBOARD_CAPTURE_SCRIPT,
             "#authorDashboardQueue",
             max((browser.element_timeout_seconds - 1) * 1000, 1000),
         )
+        stage = "validating dashboard"
         return _validated_complete_dashboard_html(payload)
-    except BrowserCaptureError:
-        raise
+    except BrowserCaptureError as exc:
+        raise BrowserCaptureError(f"Browser capture failed during {stage}: {exc}") from exc
     except Exception as exc:
-        raise BrowserCaptureError(f"Browser capture failed with {type(exc).__name__}.") from exc
+        raise BrowserCaptureError(
+            f"Browser capture failed during {stage} with {type(exc).__name__}."
+        ) from exc
     finally:
         if driver is not None:
             try:
@@ -2107,6 +2203,18 @@ def _read_positive_integer(
     return value
 
 
+def _read_non_negative_integer(
+    value: object,
+    *,
+    path: str,
+    errors: list[str],
+) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        errors.append(f"{path}: must be a non-negative integer.")
+        return None
+    return value
+
+
 def _resolve_path(value: str, *, config_dir: Path, path: str, errors: list[str]) -> Path | None:
     try:
         candidate = Path(value).expanduser()
@@ -2352,6 +2460,12 @@ def parse_config(
     errors: list[str] = []
     _add_unknown_key_errors(raw, allowed=ROOT_KEYS, path="root", errors=errors)
 
+    jitter_seconds = _read_non_negative_integer(
+        raw.get("jitter_seconds", DEFAULT_JITTER_SECONDS),
+        path="jitter_seconds",
+        errors=errors,
+    )
+
     storage = _parse_storage(
         raw.get("storage", _MISSING),
         config_dir=config_dir,
@@ -2388,7 +2502,13 @@ def parse_config(
         raise ConfigError(errors)
     assert storage is not None
     assert browser is not None
-    return AppConfig(storage=storage, browser=browser, accounts=tuple(accounts))
+    assert jitter_seconds is not None
+    return AppConfig(
+        storage=storage,
+        browser=browser,
+        accounts=tuple(accounts),
+        jitter_seconds=jitter_seconds,
+    )
 
 
 def load_config(
@@ -2410,6 +2530,27 @@ def load_config(
         config_dir=config_path.parent,
         environ=os.environ if environ is None else environ,
     )
+
+
+def apply_jitter(
+    maximum_seconds: int,
+    *,
+    random_source: Callable[[float, float], float] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+) -> float:
+    if maximum_seconds == 0:
+        LOGGER.info("Run jitter disabled maximum_seconds=0")
+        return 0.0
+    select_delay = random.uniform if random_source is None else random_source
+    sleep = time.sleep if sleeper is None else sleeper
+    delay = select_delay(0, maximum_seconds)
+    LOGGER.info(
+        "Applying run jitter delay_seconds=%.3f maximum_seconds=%d",
+        delay,
+        maximum_seconds,
+    )
+    sleep(delay)
+    return delay
 
 
 def check_account(
@@ -2435,20 +2576,41 @@ def check_account(
         parsed = parse_dashboard(html)
         prepared = prepare_check(conn, account, check_id, parsed, clock())
     except (BrowserCaptureError, DashboardParseError) as exc:
+        phase = "capture" if isinstance(exc, BrowserCaptureError) else "parse"
         error = redact_exception(
             exc,
             (account.config.password, *account.config.apprise_urls),
         )
         fail_check(conn, check_id, clock(), error)
         LOGGER.error(
-            "Account %s failed during capture or parsing: %s",
+            "Account check failed account=%r phase=%s error=%s detail=%r",
             account.config.name,
+            phase,
             error.error_type,
+            error.error_message,
         )
         return False
 
+    observed_in_scope = tuple(
+        snapshot
+        for snapshot in parsed
+        if account.config.track_all or snapshot.external_id in account.target_ids
+    )
+    LOGGER.info(
+        "Account dashboard processed account=%r parsed=%d observed_in_scope=%d events=%d",
+        account.config.name,
+        prepared.parsed_count,
+        len(observed_in_scope),
+        len(prepared.events),
+    )
+    log_manuscript_states(account.config.name, prepared.state_comparisons)
+
     if prepared.batch is None:
         complete_check_without_notification(conn, prepared, clock())
+        LOGGER.info(
+            "Account state committed account=%r notification=not_required",
+            account.config.name,
+        )
         return True
 
     results = deliver_notifications(
@@ -2459,9 +2621,34 @@ def check_account(
         clock=clock,
     )
     for result in results:
+        if result.success:
+            LOGGER.info(
+                "Notification delivery account=%r destination=%d/%d scheme=%r outcome=succeeded",
+                account.config.name,
+                result.destination_index + 1,
+                len(results),
+                result.scheme,
+            )
+        else:
+            LOGGER.info(
+                "Notification delivery account=%r destination=%d/%d scheme=%r outcome=failed "
+                "error=%s detail=%r",
+                account.config.name,
+                result.destination_index + 1,
+                len(results),
+                result.scheme,
+                result.error_type,
+                result.error_message,
+            )
         record_delivery(conn, prepared.batch.id, result)
     if any(result.success for result in results):
         commit_prepared_check(conn, prepared, clock())
+        LOGGER.info(
+            "Account state committed account=%r notification=sent successful_destinations=%d/%d",
+            account.config.name,
+            sum(result.success for result in results),
+            len(results),
+        )
         return True
 
     fail_prepared_check(
@@ -2474,8 +2661,10 @@ def check_account(
         ),
     )
     LOGGER.error(
-        "Account %s failed because every notification destination failed.",
+        "Account check failed account=%r phase=notification "
+        "error=NotificationDeliveryError detail=%r",
         account.config.name,
+        "Every notification destination failed.",
     )
     return False
 
@@ -2489,8 +2678,15 @@ def run_once(
     apprise_factory: Callable[[], Any] = apprise.Apprise,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> int:
+    run_started = time.monotonic()
     runtime_environment = os.environ if environ is None else environ
     database_path = config.storage.database_path
+    account_names = tuple(account.name for account in config.accounts)
+    LOGGER.info(
+        "Run started account_count=%d accounts=%r",
+        len(account_names),
+        account_names,
+    )
     try:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         lock = FileLock(f"{database_path}.lock", timeout=0)
@@ -2498,10 +2694,21 @@ def run_once(
             conn = connect_database(database_path)
             try:
                 migrate_database(conn)
-                recover_interrupted_checks(conn, clock())
+                recovered_count = recover_interrupted_checks(conn, clock())
+                if recovered_count:
+                    LOGGER.warning("Recovered interrupted checks count=%d", recovered_count)
                 reconciled = reconcile_configuration(conn, config.accounts, clock())
-                outcomes = [
-                    check_account(
+                outcomes: list[tuple[str, bool]] = []
+                for position, account in enumerate(config.accounts, start=1):
+                    account_started = time.monotonic()
+                    LOGGER.info(
+                        "Account check started account=%r position=%d/%d tracking=%s",
+                        account.name,
+                        position,
+                        len(config.accounts),
+                        "all" if account.track_all else f"selected:{len(account.manuscript_ids)}",
+                    )
+                    succeeded = check_account(
                         conn,
                         reconciled[account.name],
                         config.browser,
@@ -2511,9 +2718,24 @@ def run_once(
                         apprise_factory=apprise_factory,
                         clock=clock,
                     )
-                    for account in config.accounts
-                ]
-                return 0 if all(outcomes) else 1
+                    outcomes.append((account.name, succeeded))
+                    LOGGER.info(
+                        "Account check finished account=%r outcome=%s duration_seconds=%.3f",
+                        account.name,
+                        "succeeded" if succeeded else "failed",
+                        time.monotonic() - account_started,
+                    )
+                successful_names = tuple(name for name, succeeded in outcomes if succeeded)
+                failed_names = tuple(name for name, succeeded in outcomes if not succeeded)
+                outcome = "succeeded" if not failed_names else "failed"
+                LOGGER.info(
+                    "Run finished outcome=%s succeeded=%r failed=%r duration_seconds=%.3f",
+                    outcome,
+                    successful_names,
+                    failed_names,
+                    time.monotonic() - run_started,
+                )
+                return 0 if not failed_names else 1
             finally:
                 conn.close()
     except FileLockTimeout:
@@ -2550,6 +2772,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         LOGGER.error("%s", exc)
         return 2
+    apply_jitter(config.jitter_seconds)
     return run_once(config)
 
 
